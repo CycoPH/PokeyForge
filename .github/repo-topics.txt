@@ -1,0 +1,24 @@
+Suggested GitHub repo "topics" for PokeyForge.
+
+GitHub doesn't read these from a file — paste them into the repo's About panel
+(click the gear icon next to "About" on the repo landing page, then "Topics").
+Up to 20 topics are allowed; the list below is well under that.
+
+    atari
+    pokey
+    rmt
+    raster-music-tracker
+    chiptune
+    6502-emulation
+    sdl3
+    instrument-editor
+    8-bit
+    retro-audio
+    music-tools
+    windows
+    cpp17
+
+Suggested repo description (the field above the topics):
+
+    PokeyForge - a standalone Windows tool for auditioning, editing, and banking
+    Atari RMT (.RTI) POKEY instruments, driven by real 6502 + POKEY emulation.

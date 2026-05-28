@@ -1,0 +1,3 @@
+// Windows resources for PokeyForge.
+// Icon ID 1 becomes the application's .exe / taskbar icon.
+1 ICON "PokeyForge.ico"

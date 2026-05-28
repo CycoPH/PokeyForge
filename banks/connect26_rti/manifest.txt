@@ -1,0 +1,29 @@
+# PokeyForge bank manifest. slot	name	source
+0	Bass drum vin	
+1	 by radix / solitude   F-2F-4F02	
+2	finished february '94  A-3A-4F0D	
+3		
+4		
+5		
+6		
+7		
+8		
+9		
+10	Instrument 09	
+11	Instrument 12	
+12		
+13	Instrument 03	
+14	Instrument 05	
+15	Instrument 09	
+16	Shaker cut	
+17	kick djmax	
+18	Snare drum vin	
+19	Bass	
+20		
+21		
+22		
+23		
+24	desolve	
+25	rotate	
+26		
+27		D:\Projects\Cerebus\Atari\PokeyForge\instruments\Krakout.sap.rmt - instrument #1.rti

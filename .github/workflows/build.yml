@@ -1,0 +1,41 @@
+name: build
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:     [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release (x64)
+        run: msbuild PokeyForge.sln /p:Configuration=Release /p:Platform=x64 /v:minimal
+
+      - name: Stage release zip
+        shell: pwsh
+        run: ./release.ps1 -NoBuild
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PokeyForge-win64
+          path: dist/PokeyForge-*-win64.zip
+          if-no-files-found: error
+
+      # On a v* tag, also attach the zip to the matching GitHub Release.
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/PokeyForge-*-win64.zip
+          fail_on_unmatched_files: true
