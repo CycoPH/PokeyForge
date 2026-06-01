@@ -1,0 +1,95 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="src\Analysis.cpp" />
+    <ClCompile Include="src\Atari.cpp" />
+    <ClCompile Include="src\Audio.cpp" />
+    <ClCompile Include="src\Bank.cpp" />
+    <ClCompile Include="src\C6502.cpp" />
+    <ClCompile Include="src\Config.cpp" />
+    <ClCompile Include="src\Directory.cpp" />
+    <ClCompile Include="src\DriverBinaries.cpp" />
+    <ClCompile Include="src\Editor.cpp" />
+    <ClCompile Include="src\Gui.cpp" />
+    <ClCompile Include="src\Keyboard.cpp" />
+    <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\Pokey.cpp" />
+    <ClCompile Include="src\RmtEngine.cpp" />
+    <ClCompile Include="src\RtiFile.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\InstrumentTypes.h" />
+    <ClInclude Include="src\Keyboard.h" />
+    <ClInclude Include="src\RmtAddresses.h" />
+    <ClInclude Include="src\Analysis.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Atari.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Audio.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Bank.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\C6502.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Config.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Directory.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\DriverBinaries.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Editor.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Gui.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Notes.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Pokey.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\RmtEngine.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\RtiFile.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Types.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Version.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="app.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Headers">
+      <UniqueIdentifier>{cd1d80ab-36ad-4553-8dfb-2508f046ae65}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Docs">
+      <UniqueIdentifier>{7810b31c-8a6c-4555-b228-b0d3edac72a5}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="CHANGELOG.md">
+      <Filter>Docs</Filter>
+    </None>
+    <None Include="Readme.md">
+      <Filter>Docs</Filter>
+    </None>
+    <None Include="tech.md">
+      <Filter>Docs</Filter>
+    </None>
+  </ItemGroup>
+</Project>

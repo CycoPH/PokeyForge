@@ -118,5 +118,10 @@
     <ClInclude Include="src\Types.h" />
     <ClInclude Include="src\Version.h" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="CHANGELOG.md" />
+    <None Include="Readme.md" />
+    <None Include="tech.md" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

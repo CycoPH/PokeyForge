@@ -24,6 +24,10 @@
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#  include <windows.h>   // AttachConsole for headless --analyse mode
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -126,14 +130,11 @@ void DrawSplash(SDL_Renderer* r, const char* status)
     SDL_SetRenderScale(r, 1.0f, 1.0f);
 
     SDL_SetRenderDrawColor(r, 200, 200, 210, 255);
-    SDL_RenderDebugText(r, (float)(px + 42), (float)(py + 96),
-                        "RMT .RTI instrument auditioner");
+    SDL_RenderDebugText(r, (float)(px + 42), (float)(py + 96), "RMT .RTI instrument auditioner");
     SDL_SetRenderDrawColor(r, 235, 150, 40, 255);
-    SDL_RenderDebugText(r, (float)(px + 42), (float)(py + 116),
-                        "written by RetroCoder");
+    SDL_RenderDebugText(r, (float)(px + 42), (float)(py + 116), "written by RetroCoder");
     SDL_SetRenderDrawColor(r, 130, 200, 240, 255);
-    SDL_RenderDebugText(r, (float)(px + 42), (float)(py + ph - 24),
-                        status ? status : "Loading...");
+    SDL_RenderDebugText(r, (float)(px + 42), (float)(py + ph - 24), status ? status : "Loading...");
 
     SDL_RenderPresent(r);
 }
@@ -147,33 +148,23 @@ void Fatal(SDL_Window* w, const std::string& msg)
 
 std::string LocateDriverObx()
 {
-    fs::path exe_dir = fs::current_path();
-    fs::path candidate = exe_dir / "rmt_driver_v2.obx";
-    if (fs::exists(candidate)) return candidate.string();
-    fs::path runtime = exe_dir / ".." / ".." / "runtime" / "rmt_driver_v2.obx";
-    if (fs::exists(runtime)) return runtime.string();
-    return std::string{};
-}
+    // Prefer the directory the .exe lives in so launching from the Start menu,
+    // a shortcut, or a different cwd still finds the bundled driver. Falls
+    // back to ../../runtime for running uncopied development builds, and to
+    // the cwd as a last resort.
+    std::vector<fs::path> roots;
+    const char* base = SDL_GetBasePath();
+    if (base && *base) roots.emplace_back(base);
+    roots.push_back(fs::current_path());
 
-void PrintHelp()
-{
-    std::printf(
-        "PokeyForge controls\n"
-        "  a..z, 0..9       Play current instrument at chromatic pitches\n"
-        "  [ / ]            Octave shift down / up\n"
-        "  Left / Right     Previous / next .RTI (hold to repeat)\n"
-        "  Up / Down        Previous / next .RTI (hold to repeat)\n"
-        "  PageUp / PageDn  Jump by %d files\n"
-        "  Home / End       First / last file\n"
-        "  Enter            Toggle current file's folder (collapse/expand)\n"
-        "  + (=)            Add current instrument to bank\n"
-        "  -                Remove current instrument from bank\n"
-        "  F1               Toggle on-screen help / keybindings\n"
-        "  F2               Save bank to ./bank_out/\n"
-        "  F5               Toggle PAL / NTSC\n"
-        "  F11              Toggle fullscreen\n"
-        "  Esc              Silence playback (does not quit)\n"
-        "  Close window     Quit\n", kPageSize);
+    for (const auto& root : roots) {
+        fs::path here = root / "rmt_driver_v2.obx";
+        if (fs::exists(here)) return here.string();
+        fs::path dev = root / ".." / ".." / "runtime" / "rmt_driver_v2.obx";
+        std::error_code ec;
+        if (fs::exists(dev, ec)) return fs::weakly_canonical(dev, ec).string();
+    }
+    return std::string{};
 }
 
 // Synchronous SDL dialogs. Each pumps events while the native dialog is open
@@ -210,22 +201,35 @@ std::string PickFolderModal(SDL_Window* window, const char* start = nullptr)
     return PumpDialog(r);
 }
 
-std::string SaveFileModal(SDL_Window* window, const SDL_DialogFileFilter* filters,
-                          int nfilters, const char* start = nullptr)
+std::string SaveFileModal(SDL_Window* window, const SDL_DialogFileFilter* filters, int nfilters, const char* start = nullptr)
 {
     DlgResult r;
     SDL_ShowSaveFileDialog(&DialogCallback, &r, window, filters, nfilters, start);
     return PumpDialog(r);
 }
 
-std::string OpenFileModal(SDL_Window* window, const SDL_DialogFileFilter* filters,
-                          int nfilters, const char* start = nullptr)
+std::string OpenFileModal(SDL_Window* window, const SDL_DialogFileFilter* filters, int nfilters, const char* start = nullptr)
 {
     DlgResult r;
     SDL_ShowOpenFileDialog(&DialogCallback, &r, window, filters, nfilters, start, false);
     return PumpDialog(r);
 }
 
+// Central composition root. Owns all the major subsystems (engine, audio,
+// directory model, bank, editor) plus the transient UI state (modals, search
+// bar, edit mode, mouse pos, bank context menu) and exposes a handful of
+// verb methods (LoadCurrent, AddToBank, NewSlot, ...) that the event loop
+// dispatches keys/clicks to. The Gui never sees the App directly — main()
+// snapshots the relevant fields into a GuiState per frame.
+//
+// The "current" instrument has two possible sources (current_source):
+//   Source::Directory - loaded from the directory tree; current_rti is the
+//                       on-disk file and current_bank_slot is -1.
+//   Source::Bank      - loaded from a bank slot; current_bank_slot is that
+//                       slot's index. current_rti is empty.
+// In both cases, current_instr holds the live, possibly-edited working
+// copy and modified=true means it has unsaved changes (which trips the
+// Save/Discard/Cancel prompt on navigation via GuardedNav).
 struct App {
     RmtEngine    engine;
     Audio        audio;
@@ -239,6 +243,7 @@ struct App {
     int          last_note_played = -1;
     bool         fullscreen = false;
     bool         show_help = false;
+    int          help_page = 0;       // current page of the F1 help overlay
     bool         show_about = false;
 
     SDL_Window*   window = nullptr;
@@ -281,6 +286,33 @@ struct App {
     std::string  confirm_msg;
     std::function<void()> confirm_action;
 
+    // Bank-slot right-click context menu.
+    bool         bank_menu_open = false;
+    int          bank_menu_slot = -1;
+    int          bank_menu_x = 0;
+    int          bank_menu_y = 0;
+
+    // Directory-tree right-click context menu.
+    bool         tree_menu_open = false;
+    int          tree_menu_node = -1;
+    int          tree_menu_x = 0;
+    int          tree_menu_y = 0;
+
+    // Category picker, chained from the tree menu's "Override..." action.
+    bool         cat_picker_open = false;
+    int          cat_picker_node = -1;
+    int          cat_picker_x = 0;
+    int          cat_picker_y = 0;
+
+    // Latest mouse position in logical (1280x720) coords. Used by the GUI
+    // for hover highlights (currently the bank context menu).
+    int          mouse_x = -1;
+    int          mouse_y = -1;
+
+    // Manual k-means cluster count override for the next analysis run.
+    // 0 = use the automatic choice (ceil(sqrt(N/2)) clamped to [3,12]).
+    int          k_clusters_override = 0;
+
     void AskConfirm(const std::string& msg, std::function<void()> action)
     {
         confirm_msg = msg;
@@ -319,6 +351,13 @@ struct App {
             current_instr_valid = false;
             return false;
         }
+        // Stop any note still ringing on the outgoing instrument before
+        // overwriting the slot, so the audition cuts cleanly on each switch.
+        // Also drop out of edit mode: the cursor/panel state belongs to the
+        // outgoing instrument and would be confusing on the new one.
+        engine.Silence();
+        last_note_played = -1;
+        editor.SetActive(false);
         const auto& n = dir.At(node);
         if (!current_rti.LoadFromFile(n.path.c_str())) {
             std::fprintf(stderr, "Failed to load %s\n", n.path.c_str());
@@ -353,6 +392,9 @@ struct App {
         const Bank::Slot& s = bank.At(slot);
         if (!s.used) return false;
 
+        engine.Silence();
+        last_note_played = -1;
+        editor.SetActive(false);
         engine.LoadInstrumentSlot(kInstrSlot, s.ata.data(), s.ata.size());
         current_instr_valid = DecodeAta(s.ata, current_instr);
         // The decoder blanks the name (the ATA blob has none); restore it from
@@ -393,6 +435,9 @@ struct App {
     void PlayNote(int semitone)
     {
         last_play_semitone = semitone;
+        // No instrument loaded (e.g. after clearing the current bank slot):
+        // ignore key presses so the engine's last-loaded data can't play.
+        if (!current_instr_valid) return;
         int note = Keyboard::BASE_NOTE + semitone + octave_shift;
         note = std::clamp(note, kMinNote, kMaxNote);
         engine.NoteOn(kBaseTrack, note, kInstrSlot, kPlayVolume);
@@ -401,6 +446,7 @@ struct App {
 
     void RetriggerNote()
     {
+        if (!current_instr_valid) return;
         int note = Keyboard::BASE_NOTE + last_play_semitone + octave_shift;
         note = std::clamp(note, kMinNote, kMaxNote);
         engine.NoteOn(kBaseTrack, note, kInstrSlot, kPlayVolume);
@@ -660,15 +706,49 @@ struct App {
     void AddToBank()
     {
         if (!current_instr_valid) return;
-        // Unmodified directory instrument already present -> no duplicate.
-        if (!modified && current_source == Source::Directory &&
-            current_rti.Valid() && bank.IndexOfPath(current_rti.Path()) >= 0) {
-            SetNotice("Already in bank.");
+        // Editing a bank slot: '+' just commits the edit back in place.
+        if (current_source == Source::Bank) { CommitToBank(); return; }
+
+        // Sound-identical instruments are deduplicated by ATA blob (names and
+        // source paths are ignored). If the same sound is already in a slot,
+        // move the highlight to that slot instead of creating a duplicate.
+        std::vector<byte> ata = RtiFile::InstrumentToAta(current_instr, /*stereo=*/false);
+        int existing = bank.IndexOfAta(ata);
+        if (existing >= 0) {
+            bank_cursor = existing;
+            SetNotice("Already in bank: slot " + std::to_string(existing) +
+                      " ('" + bank.At(existing).name + "')");
             return;
         }
-        // Commit the working copy (adds a new slot, or updates the bank slot
-        // this instrument came from).
         CommitToBank();
+    }
+
+    // Right-click on a directory file: add that file to the bank without
+    // disturbing the currently-loaded instrument or its edit state. If the
+    // same sound is already in the bank, move the highlight to it instead.
+    void AddFileNodeToBank(int node)
+    {
+        if (node < 0 || node >= dir.NodeCount()) return;
+        const auto& n = dir.At(node);
+        if (n.type != Directory::NodeType::File) return;
+
+        RtiFile rti;
+        if (!rti.LoadFromFile(n.path.c_str())) {
+            SetNotice("Failed to load " + fs::path(n.path).filename().string());
+            return;
+        }
+        int existing = bank.IndexOfAta(rti.AtaBlob());
+        if (existing >= 0) {
+            bank_cursor = existing;
+            SetNotice("Already in bank: slot " + std::to_string(existing) +
+                      " ('" + bank.At(existing).name + "')");
+            return;
+        }
+        int slot = bank.Add(rti);
+        if (slot < 0) { SetNotice("Bank full (64/64)."); return; }
+        bank_cursor = slot;   // move highlight to the freshly-added slot
+        SetNotice("Added '" + rti.Name() + "' to slot " + std::to_string(slot) +
+                  " (" + std::to_string(bank.UsedCount()) + "/64)");
     }
 
     void RemoveFromBank()
@@ -735,6 +815,190 @@ struct App {
         }
     }
 
+    // ---------- Bank-slot context-menu actions ----------
+
+    void OpenBankSlotMenu(int slot, int x, int y)
+    {
+        if (slot < 0 || slot >= Bank::SLOT_COUNT) return;
+        bank_menu_open = true;
+        bank_menu_slot = slot;
+        bank_menu_x    = x;
+        bank_menu_y    = y;
+    }
+
+    void CloseBankSlotMenu() { bank_menu_open = false; }
+
+    // Open the directory-tree right-click menu anchored at (x,y) for the
+    // given file node.
+    void OpenTreeMenu(int node, int x, int y)
+    {
+        if (node < 0 || node >= dir.NodeCount()) return;
+        if (dir.At(node).type != Directory::NodeType::File) return;
+        tree_menu_open = true;
+        tree_menu_node = node;
+        tree_menu_x    = x;
+        tree_menu_y    = y;
+    }
+
+    void CloseTreeMenu() { tree_menu_open = false; }
+
+    void OpenCategoryPicker(int node, int x, int y)
+    {
+        if (node < 0 || node >= dir.NodeCount()) return;
+        cat_picker_open = true;
+        cat_picker_node = node;
+        cat_picker_x    = x;
+        cat_picker_y    = y;
+    }
+    void CloseCategoryPicker() { cat_picker_open = false; }
+
+    // Adjust the manual k-means cluster count for the next analysis run.
+    // Negative values clamp to 0 (which means "automatic" inside Analysis).
+    void StepClusterCount(int delta)
+    {
+        int next = k_clusters_override + delta;
+        if (next < 0)  next = 0;
+        if (next > 24) next = 24;
+        k_clusters_override = next;
+        if (k_clusters_override == 0) {
+            SetNotice("Cluster count: auto (re-run F7 to apply)");
+        } else {
+            SetNotice("Cluster count: " + std::to_string(k_clusters_override) +
+                      " (re-run F7 to apply)");
+        }
+    }
+
+    // Ctrl+Shift+R: clear every per-file manual override across the whole
+    // library. No confirm dialog - the action is fully reversible by
+    // setting overrides again.
+    void ClearAllOverrides()
+    {
+        int count = 0;
+        for (int f : dir.AllFiles()) {
+            if (dir.GetFileManualCategory(f) >= 0) ++count;
+        }
+        if (count == 0) {
+            SetNotice("No manual overrides to clear.");
+            return;
+        }
+        dir.ClearAllManualOverrides();
+        SetNotice("Cleared " + std::to_string(count) + " manual override(s)");
+    }
+
+    // Build a brand-new TInstrument with sensible defaults so it's audible
+    // straight away. Used by NewSlot.
+    static void InitBlankInstrument(TInstrument& ins)
+    {
+        ins = TInstrument{};
+        // Name: "New" padded with spaces to the fixed width.
+        std::memset(ins.name, ' ', INSTRUMENT_NAME_MAX_LEN);
+        ins.name[INSTRUMENT_NAME_MAX_LEN] = '\0';
+        const char* nm = "New";
+        for (int i = 0; nm[i] != '\0' && i < INSTRUMENT_NAME_MAX_LEN; ++i)
+            ins.name[i] = nm[i];
+        // Single-step envelope at full volume with a pulse waveform so the
+        // user hears something immediately and can edit from there.
+        ins.parameters[PAR_TBL_SPEED] = 1;
+        ins.envelope[0][VOLUMER]    = 15;
+        ins.envelope[0][VOLUMEL]    = 15;
+        ins.envelope[0][DISTORTION] = 10;   // pulse
+    }
+
+    // Menu: New -> blank instrument in slot, cursor in the name field.
+    void NewSlot(int slot)
+    {
+        if (slot < 0 || slot >= Bank::SLOT_COUNT) return;
+        GuardedNav([this, slot]() {
+            TInstrument blank{};
+            InitBlankInstrument(blank);
+            std::vector<byte> ata = RtiFile::InstrumentToAta(blank, /*stereo=*/false);
+            bank.SetSlot(slot, "New", ata, /*source=*/"");
+            bank_cursor = slot;
+            LoadBankSlot(slot);
+            // Drop straight into name-edit so the user can type a real name.
+            EnterEditField(Editor::Panel::Name, 0, 0);
+            SetNotice("New instrument in slot " + std::to_string(slot));
+        });
+    }
+
+    // Menu: Clear -> empty this slot (with confirm if it's occupied).
+    void ClearSlot(int slot)
+    {
+        if (slot < 0 || slot >= Bank::SLOT_COUNT) return;
+        if (!bank.At(slot).used) {
+            SetNotice("Slot " + std::to_string(slot) + " is already empty");
+            return;
+        }
+        AskConfirm("Clear slot " + std::to_string(slot) + " ('" +
+                   bank.At(slot).name + "')?",
+                   [this, slot]() {
+            bank.Remove(slot);
+            if (current_source == Source::Bank && current_bank_slot == slot) {
+                current_bank_slot = -1;
+                current_source = Source::Directory;
+                current_instr_valid = false;
+                current_rti = RtiFile{};
+                editor.SetActive(false);
+                engine.Silence();
+                // Wipe the engine's instrument slot so a stray NoteOn can't
+                // resurrect the cleared instrument's POKEY shadow data.
+                std::vector<byte> blank(256, 0);
+                engine.LoadInstrumentSlot(kInstrSlot, blank.data(), blank.size());
+            }
+            SetNotice("Slot " + std::to_string(slot) + " cleared");
+        });
+    }
+
+    // Menu: Export RTI -> save the slot's stored ATA blob as a .rti file.
+    void ExportSlot(int slot)
+    {
+        if (slot < 0 || slot >= Bank::SLOT_COUNT) return;
+        const Bank::Slot& sl = bank.At(slot);
+        if (!sl.used) {
+            SetNotice("Slot " + std::to_string(slot) + " is empty");
+            return;
+        }
+        static const SDL_DialogFileFilter filters[] = { { "RMT instrument", "rti" } };
+        std::string path = SaveFileModal(window, filters, 1,
+                                         library_path.empty() ? nullptr : library_path.c_str());
+        if (path.empty()) { SetNotice("Export cancelled."); return; }
+        fs::path rti(path);
+        if (rti.extension() != ".rti") rti += ".rti";
+        if (RtiFile::WriteFile(rti.string(), sl.name, sl.ata))
+            SetNotice("Exported " + rti.filename().string());
+        else
+            SetNotice("Export failed.");
+    }
+
+    // Menu: Import RTI -> load a .rti file directly into this slot.
+    void ImportSlot(int slot)
+    {
+        if (slot < 0 || slot >= Bank::SLOT_COUNT) return;
+        static const SDL_DialogFileFilter filters[] = { { "RMT instrument", "rti" } };
+        std::string path = OpenFileModal(window, filters, 1,
+                                         library_path.empty() ? nullptr : library_path.c_str());
+        if (path.empty()) { SetNotice("Import cancelled."); return; }
+
+        RtiFile rti;
+        if (!rti.LoadFromFile(path.c_str())) {
+            SetNotice("Failed to load " + fs::path(path).filename().string());
+            return;
+        }
+
+        auto apply = [this, slot, rti]() {
+            bank.AddAt(slot, rti);
+            bank_cursor = slot;
+            LoadBankSlot(slot);
+            SetNotice("Imported into slot " + std::to_string(slot));
+        };
+        if (bank.At(slot).used) {
+            AskConfirm("Overwrite slot " + std::to_string(slot) + " ('" +
+                       bank.At(slot).name + "') with '" + rti.Name() + "'?", apply);
+        } else {
+            apply();
+        }
+    }
+
     // Ctrl+S: export the current (edited) instrument as a .RTI under a new name.
     void ExportCurrentRti()
     {
@@ -761,7 +1025,7 @@ struct App {
     {
         if (!dir.Scan(folder)) { SetNotice("Cannot open: " + folder); return false; }
         library_path = folder;
-        Analysis::LoadAndApply(dir, library_path);
+        LoadOrRunAnalysis();
         if (!selectFile.empty()) {
             std::error_code ec;
             fs::path want = fs::absolute(selectFile, ec);
@@ -830,6 +1094,10 @@ struct App {
         if (folder.empty()) { SetNotice("Switch library cancelled."); return false; }
         if (!dir.Scan(folder)) { SetNotice("Cannot scan: " + folder); return false; }
         library_path = folder;
+        // Load cached analysis for the new library, or auto-run if missing -
+        // same behaviour as startup so the user never browses an unanalysed
+        // library by accident.
+        LoadOrRunAnalysis();
         dir.SetCurrentFileIndex(0);
         LoadCurrent();
         SaveConfig();
@@ -843,17 +1111,110 @@ struct App {
         return gui ? gui->BankSlotAtLogical((int)lx, (int)ly) : -1;
     }
 
-    // F7: analyse the library (classify + find duplicates), hide duplicates,
-    // and cache the result to analysis.json.
+    // Apply the cached analysis.json for the current library if present;
+    // otherwise run a fresh analysis (showing a splash so the user knows
+    // what the wait is for) and cache it. Always defaults to hiding
+    // duplicates after a successful analysis - this is what the curated
+    // browsing list shows on launch / library switch.
+    //
+    // Called from startup, SwitchLibrary, and OpenLibraryPath so every
+    // library the user opens ends up analysed; F7 ('Analyse') re-runs
+    // analysis explicitly on the same library.
+    void LoadOrRunAnalysis()
+    {
+        if (Analysis::LoadAndApply(dir, library_path)) {
+            dir.SetHideDuplicates(true);
+            std::printf("Loaded analysis.json\n");
+            return;
+        }
+        if (dir.AllFiles().empty()) return;   // empty library, nothing to do
+        // Kill any currently-ringing note before analysis takes over.
+        engine.Silence();
+        last_note_played = -1;
+        Analysis::Options opts;
+        opts.engine     = &engine;
+        opts.k_override = k_clusters_override;
+        opts.progress   = &App::AnalysisProgressThunk;
+        opts.progress_ud = this;
+        Analysis::Summary sum = Analysis::Run(dir, library_path,
+                                              /*writeJson=*/true, opts);
+        if (sum.ok) {
+            dir.SetHideDuplicates(true);
+            PrintAnalysisReport(sum);
+            SetNotice("Analysed " + std::to_string(sum.total) + " instruments, " +
+                      std::to_string(sum.duplicates) + " duplicates, " +
+                      std::to_string(sum.clusters) + " clusters");
+        }
+    }
+
+    // F7: re-run analysis on the current library (classify + find duplicates,
+    // hide dupes, rewrite analysis.json). Equivalent to forcing the auto-run
+    // path of LoadOrRunAnalysis even when a cache is present.
     void AnalyseLibrary()
     {
-        if (renderer) DrawBusy(renderer, "Analysing instrument library...");
-        Analysis::Summary sum = Analysis::Run(dir, library_path, /*writeJson=*/true);
+        engine.Silence();
+        last_note_played = -1;
+        Analysis::Options opts;
+        opts.engine     = &engine;
+        opts.k_override = k_clusters_override;
+        opts.progress   = &App::AnalysisProgressThunk;
+        opts.progress_ud = this;
+        Analysis::Summary sum = Analysis::Run(dir, library_path,
+                                              /*writeJson=*/true, opts);
         if (!sum.ok) { SetNotice("Analysis failed."); return; }
         dir.SetHideDuplicates(true);
-        LoadCurrent();
+        LoadCurrent();   // restores the engine's instrument slot to the live one
+        PrintAnalysisReport(sum);
         SetNotice("Analysed " + std::to_string(sum.total) + " instruments, " +
-                  std::to_string(sum.duplicates) + " duplicates hidden. Saved analysis.json");
+                  std::to_string(sum.duplicates) + " duplicates, " +
+                  std::to_string(sum.clusters) + " clusters. Saved analysis.json");
+    }
+
+    // Thunk that bridges the C-style Analysis progress callback back to
+    // an App method. Redraws the splash with the current "N / M" count
+    // and pumps SDL events so the window doesn't appear hung on big
+    // libraries.
+    static void AnalysisProgressThunk(int current, int total, void* userdata)
+    {
+        auto* app = static_cast<App*>(userdata);
+        if (!app || !app->renderer) return;
+        char msg[160];
+        int pct = total > 0 ? (current * 100) / total : 0;
+        std::snprintf(msg, sizeof(msg),
+            "Analysing instruments %d / %d  (%d%%)", current, total, pct);
+        DrawSplash(app->renderer, msg);
+        // Pump the OS event queue so the window stays responsive (move /
+        // close events get processed); we drop the events because the main
+        // loop owns input.
+        SDL_Event drop;
+        while (SDL_PollEvent(&drop)) { /* discard */ }
+    }
+
+    // Dump a per-category count breakdown to stdout after analysis. Quick
+    // way to spot a library that's heavy on one category or to notice that
+    // "Other" has too many entries (i.e. the classifier is giving up).
+    void PrintAnalysisReport(const Analysis::Summary& sum)
+    {
+        int counts[(int)Analysis::Category::COUNT] = { 0 };
+        int total_files = 0;
+        int low_conf    = 0;
+        for (int f : dir.AllFiles()) {
+            int c = dir.EffectiveCategory(f);
+            if (c >= 0 && c < (int)Analysis::Category::COUNT) counts[c]++;
+            if (dir.At(f).confidence == 1) ++low_conf;
+            ++total_files;
+        }
+        std::printf("--- Analysis report ----------------------------------\n");
+        std::printf("  Library: %s\n", library_path.c_str());
+        std::printf("  Files:   %d   (duplicates: %d, clusters: %d)\n",
+                    total_files, sum.duplicates, sum.clusters);
+        std::printf("  Low-confidence rows: %d\n", low_conf);
+        for (int i = 0; i < (int)Analysis::Category::COUNT; ++i) {
+            if (counts[i] == 0) continue;
+            std::printf("    %-18s %d\n",
+                        Analysis::Name((Analysis::Category)i), counts[i]);
+        }
+        std::printf("------------------------------------------------------\n");
     }
 
     // F8: toggle the directory tree between folder view and group-by-category.
@@ -866,12 +1227,62 @@ struct App {
         SetNotice(cat ? "View: folders" : "View: grouped by category");
     }
 
+    // F10: toggle Cluster view. Falls back to Folder view if the current
+    // library has no clusters (analysis didn't run, or k=0).
+    void ToggleClusterView()
+    {
+        if (dir.GetViewMode() == Directory::ViewMode::Cluster) {
+            dir.SetViewMode(Directory::ViewMode::Folder);
+            LoadCurrent();
+            SetNotice("View: folders");
+            return;
+        }
+        if (dir.ClusterCount() <= 0) {
+            SetNotice("No clusters yet - run F7 Analyse first.");
+            return;
+        }
+        dir.SetViewMode(Directory::ViewMode::Cluster);
+        LoadCurrent();
+        SetNotice("View: grouped by cluster (" +
+                  std::to_string(dir.ClusterCount()) + " clusters)");
+    }
+
+    // Ctrl+R: cycle the current file's manual category override through
+    // every Analysis::Category value, ending at "use auto" (-1). The
+    // tree's "M" marker shows when an override is set; saving analysis
+    // again persists it.
+    void CycleManualCategory()
+    {
+        int node = dir.CurrentNodeIndex();
+        if (node < 0) return;
+        int cur = dir.GetFileManualCategory(node);
+        int next = cur + 1;
+        if (next >= (int)Analysis::Category::COUNT) next = -1;   // wrap to auto
+        dir.SetFileManualCategory(node, next);
+        if (next < 0) {
+            SetNotice("Reclassify: cleared override (using auto)");
+        } else {
+            SetNotice(std::string("Reclassify: ") + Analysis::Name((Analysis::Category)next));
+        }
+    }
+
     // F9: show/hide duplicates again.
     void ToggleHideDuplicates()
     {
         dir.SetHideDuplicates(!dir.HideDuplicates());
         LoadCurrent();
         SetNotice(dir.HideDuplicates() ? "Duplicates hidden" : "Duplicates shown");
+    }
+
+    // Adjust octave_shift by `delta` semitones (mouse wheel uses ±12 per
+    // notch to match the [ / ] keys), clamped to the same ±24 range.
+    void AdjustOctave(int delta)
+    {
+        int next = std::clamp(octave_shift + delta, -24, +24);
+        if (next == octave_shift) return;
+        octave_shift = next;
+        SetNotice("Octave shift " + std::to_string(octave_shift / 12) +
+                  " (" + std::to_string(octave_shift) + " semitones)");
     }
 
     void TogglePalNtsc()
@@ -938,8 +1349,63 @@ char NameChar(SDL_Keycode k, bool shift)
 
 } // anonymous namespace
 
+// Headless CLI mode: scan a folder, run analysis, write analysis.json
+// (and analysis_report.csv) next to the instruments, exit. Used by
+// release.ps1 to pre-analyse the bundled instruments folder so the user
+// doesn't have to wait for first-launch analysis. No SDL window, no
+// audio device, no engine - the analysis pass is parametric-only in
+// this release anyway, so all we need is the .RTI parser and the
+// Directory + Analysis classes.
+int RunHeadlessAnalyse(const std::string& folder)
+{
+#ifdef _WIN32
+    // PokeyForge is built as a Windows-subsystem app, which has no
+    // stdout/stderr by default. When invoked from a console (CMD,
+    // PowerShell) we attach to the parent's console so the analysis
+    // progress messages actually appear instead of vanishing.
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        std::freopen("CONOUT$", "w", stdout);
+        std::freopen("CONOUT$", "w", stderr);
+    }
+#endif
+    std::error_code ec;
+    if (!fs::is_directory(folder, ec)) {
+        std::fprintf(stderr, "PokeyForge --analyse: not a directory: %s\n",
+                     folder.c_str());
+        return 2;
+    }
+    Directory dir;
+    if (!dir.Scan(folder)) {
+        std::fprintf(stderr, "PokeyForge --analyse: scan failed: %s\n",
+                     folder.c_str());
+        return 3;
+    }
+    if (dir.AllFiles().empty()) {
+        std::fprintf(stderr, "PokeyForge --analyse: no .RTI files under %s\n",
+                     folder.c_str());
+        return 4;
+    }
+    std::printf("PokeyForge --analyse: %d .RTI files in %s\n",
+                (int)dir.AllFiles().size(), folder.c_str());
+    Analysis::Options opts;   // engine left null -> parametric-only path
+    Analysis::Summary sum = Analysis::Run(dir, folder, /*writeJson=*/true, opts);
+    if (!sum.ok) {
+        std::fprintf(stderr, "PokeyForge --analyse: analysis failed\n");
+        return 5;
+    }
+    std::printf("PokeyForge --analyse: %d instruments, %d duplicates, %d clusters\n",
+                sum.total, sum.duplicates, sum.clusters);
+    return 0;
+}
+
 int main(int argc, char* argv[])
 {
+    // Headless analysis: PokeyForge.exe --analyse <folder>. Returns 0 on
+    // success, non-zero on failure. Bypasses all SDL / GUI startup.
+    if (argc >= 3 && std::strcmp(argv[1], "--analyse") == 0) {
+        return RunHeadlessAnalyse(argv[2]);
+    }
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
         Fatal(nullptr, std::string("SDL could not start:\n") + SDL_GetError());
         return 1;
@@ -999,6 +1465,11 @@ int main(int argc, char* argv[])
         root = config.library;
         restore_file_index = config.last_file;
     } else {
+        // No remembered library and no command-line argument: tell the user
+        // what's about to happen, then bring up the folder picker. The
+        // splash stays behind the native dialog so the screen isn't blank
+        // while they're choosing.
+        DrawSplash(renderer, "Looking for instrument folder - please choose one...");
         std::string picked = PickFolderModal(window);
         if (picked.empty()) {
             std::fprintf(stderr, "No folder selected; exiting.\n");
@@ -1046,13 +1517,11 @@ int main(int argc, char* argv[])
     app.library_path = root.string();
     app.last_bank_path = config.last_bank;
 
-    // Apply a cached analysis.json if present (categories + duplicates), and
-    // hide duplicates by default so the curated list shows on launch.
+    // Apply cached analysis.json if present, or auto-run a fresh analysis
+    // (with a splash) when the library has no cache yet. Always defaults to
+    // hiding duplicates so the curated list shows on launch.
     DrawSplash(renderer, "Loading analysis...");
-    if (Analysis::LoadAndApply(app.dir, app.library_path)) {
-        app.dir.SetHideDuplicates(true);
-        std::printf("Loaded analysis.json\n");
-    }
+    app.LoadOrRunAnalysis();
 
     // Auto-reload the last bank if it still exists.
     if (!app.last_bank_path.empty() && fs::exists(app.last_bank_path, ec)) {
@@ -1073,7 +1542,6 @@ int main(int argc, char* argv[])
         app.dir.SetCurrentFileIndex(restore_file_index);
     }
     app.LoadCurrent();
-    PrintHelp();
 
     Gui gui;
     app.gui = &gui;
@@ -1098,30 +1566,106 @@ int main(int argc, char* argv[])
                 continue;
             }
 
-            // Any click dismisses the About or Help popup.
-            if ((app.show_about || app.show_help) &&
-                event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+            // About popup: any click dismisses it.
+            if (app.show_about && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
                 app.show_about = false;
-                app.show_help = false;
+                continue;
+            }
+            // Help overlay: click the Prev / Next paging buttons to change
+            // page; click anywhere outside the panel to dismiss; clicks
+            // INSIDE the panel are ignored so the user can browse without
+            // accidentally closing the overlay.
+            if (app.show_help && event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+                SDL_ConvertEventToRenderCoordinates(renderer, &event);
+                int mx = (int)event.button.x;
+                int my = (int)event.button.y;
+                int dir = gui.HelpPageButtonAtLogical(mx, my);
+                if (dir != 0) {
+                    app.help_page = (app.help_page + dir + Gui::kHelpPageCount)
+                                    % Gui::kHelpPageCount;
+                } else if (!gui.PointInHelpPanel(mx, my)) {
+                    app.show_help = false;
+                }
                 continue;
             }
 
-            // Mouse wheel: step the instrument selection (up = previous).
+            // Mouse wheel: by default steps the instrument selection (up =
+            // previous). When a field is being edited and the cursor is
+            // outside the directory pane, the wheel nudges the focused
+            // numeric field by +/- 1 instead (wheel up = increase).
             if (event.type == SDL_EVENT_MOUSE_WHEEL) {
                 if (app.show_prompt || app.show_confirm || app.show_about) continue;
                 int notches = (event.wheel.y > 0) ? -1 : (event.wheel.y < 0) ? 1 : 0;
-                if (notches) app.StepFiles(notches * 3);   // 3 files per notch = quick
+                if (!notches) continue;
+                SDL_ConvertEventToRenderCoordinates(renderer, &event);
+                int mx = (int)event.wheel.mouse_x;
+                int my = (int)event.wheel.mouse_y;
+                // Mouse over the "Oct: +N" indicator: wheel changes octave
+                // (one octave per notch, same as the [ / ] keys). Checked
+                // first so the indicator is always responsive, even in
+                // Edit mode.
+                if (gui.PointInOctaveIndicator(mx, my)) {
+                    app.AdjustOctave(-notches * 12);  // wheel up -> +12
+                    continue;
+                }
+                if (app.editor.active && !gui.PointInTreePane(mx, my)) {
+                    app.EditNudge(-notches);    // wheel up -> +1, wheel down -> -1
+                } else {
+                    app.StepFiles(notches * 3); // 3 files per notch = quick
+                }
                 continue;
             }
 
-            // Right-click: toggle a binary instrument field under the cursor.
+            // Mouse motion: always record the latest logical position (used
+            // by the GUI for hover highlights). While the tree scrollbar is
+            // being dragged, also forward the y coordinate to the drag.
+            if (event.type == SDL_EVENT_MOUSE_MOTION) {
+                SDL_ConvertEventToRenderCoordinates(renderer, &event);
+                app.mouse_x = (int)event.motion.x;
+                app.mouse_y = (int)event.motion.y;
+                if (gui.TreeScrollDragging()) {
+                    gui.UpdateTreeScrollDrag((int)event.motion.y);
+                }
+                continue;
+            }
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_UP &&
+                event.button.button == SDL_BUTTON_LEFT &&
+                gui.TreeScrollDragging()) {
+                gui.EndTreeScrollDrag();
+                continue;
+            }
+
+            // Right-click:
+            //   - on a directory file row -> add that file to the bank
+            //     (same effect as '+', but for the row under the cursor,
+            //     without changing the current instrument)
+            //   - on a bank slot           -> open the context menu
+            //   - anywhere else            -> toggle the binary instrument
+            //     field under the cursor.
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                 event.button.button == SDL_BUTTON_RIGHT) {
                 if (app.show_prompt || app.show_confirm || app.show_about) continue;
-                if (!app.current_instr_valid) continue;
                 SDL_ConvertEventToRenderCoordinates(renderer, &event);
-                Gui::EditHit h = gui.EditFieldAtLogical(
-                    (int)event.button.x, (int)event.button.y, app.current_instr);
+                int mx = (int)event.button.x;
+                int my = (int)event.button.y;
+
+                int trow = gui.TreeRowAtLogical(mx, my);
+                if (trow >= 0 && trow < (int)app.dir.Rows().size()) {
+                    const auto& row = app.dir.Rows()[trow];
+                    if (!row.is_header &&
+                        app.dir.At(row.node).type == Directory::NodeType::File) {
+                        app.OpenTreeMenu(row.node, mx, my);
+                    }
+                    continue;
+                }
+
+                int slot = gui.BankSlotAtLogical(mx, my);
+                if (slot >= 0) {
+                    app.OpenBankSlotMenu(slot, mx, my);
+                    continue;
+                }
+                if (!app.current_instr_valid) continue;
+                Gui::EditHit h = gui.EditFieldAtLogical(mx, my, app.current_instr);
                 if (h.hit) {
                     app.EnterEditField(h.panel, h.a, h.b);
                     app.ToggleField();
@@ -1132,6 +1676,88 @@ int main(int argc, char* argv[])
             if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
                 event.button.button == SDL_BUTTON_LEFT) {
                 SDL_ConvertEventToRenderCoordinates(renderer, &event);
+
+                // Bank-slot context menu: any click closes it. A click on a
+                // menu item also triggers its action. The menu is closed
+                // before invoking the action because some actions open a
+                // confirm dialog which must not stack with the menu.
+                if (app.bank_menu_open) {
+                    int mx = (int)event.button.x;
+                    int my = (int)event.button.y;
+                    Gui::BankMenuItem mi = Gui::BankMenuItem::None;
+                    if (gui.PointInBankMenu(mx, my, app.bank_menu_x, app.bank_menu_y)) {
+                        mi = gui.BankMenuItemAtLogical(
+                            mx, my, app.bank_menu_x, app.bank_menu_y);
+                    }
+                    int slot = app.bank_menu_slot;
+                    bool slot_used = (slot >= 0 && slot < Bank::SLOT_COUNT &&
+                                      app.bank.At(slot).used);
+                    app.CloseBankSlotMenu();
+                    switch (mi) {
+                        case Gui::BankMenuItem::New:    app.NewSlot(slot); break;
+                        case Gui::BankMenuItem::Clear:  if (slot_used) app.ClearSlot(slot);  break;
+                        case Gui::BankMenuItem::Export: if (slot_used) app.ExportSlot(slot); break;
+                        case Gui::BankMenuItem::Import: app.ImportSlot(slot); break;
+                        case Gui::BankMenuItem::None:   break; // click outside = dismiss
+                    }
+                    continue;
+                }
+
+                // Directory-tree context menu (right-clicked an instrument
+                // file row). Same dismiss-on-any-click rule as the bank
+                // menu; clicking on an item also fires its action.
+                if (app.tree_menu_open) {
+                    int mx = (int)event.button.x;
+                    int my = (int)event.button.y;
+                    bool has_ov = (app.tree_menu_node >= 0 &&
+                        app.dir.GetFileManualCategory(app.tree_menu_node) >= 0);
+                    Gui::TreeMenuItem mi = Gui::TreeMenuItem::None;
+                    if (gui.PointInTreeMenu(mx, my, app.tree_menu_x, app.tree_menu_y,
+                                            has_ov)) {
+                        mi = gui.TreeMenuItemAtLogical(
+                            mx, my, app.tree_menu_x, app.tree_menu_y, has_ov);
+                    }
+                    int node = app.tree_menu_node;
+                    app.CloseTreeMenu();
+                    switch (mi) {
+                        case Gui::TreeMenuItem::AddToBank:
+                            app.AddFileNodeToBank(node);
+                            break;
+                        case Gui::TreeMenuItem::OverrideSubmenu:
+                            app.OpenCategoryPicker(node, mx, my);
+                            break;
+                        case Gui::TreeMenuItem::ClearOverride:
+                            app.dir.SetFileManualCategory(node, -1);
+                            app.SetNotice("Cleared override (using auto)");
+                            break;
+                        case Gui::TreeMenuItem::None:
+                            break; // click outside = dismiss
+                    }
+                    continue;
+                }
+
+                // Category picker popup, chained from "Override category".
+                if (app.cat_picker_open) {
+                    int mx = (int)event.button.x;
+                    int my = (int)event.button.y;
+                    int picked = -2;   // -2 = outside, -1 = clear, 0..N = category
+                    if (gui.PointInCategoryPicker(mx, my,
+                            app.cat_picker_x, app.cat_picker_y)) {
+                        picked = gui.CategoryPickerItemAtLogical(
+                            mx, my, app.cat_picker_x, app.cat_picker_y);
+                    }
+                    int node = app.cat_picker_node;
+                    app.CloseCategoryPicker();
+                    if (picked == -1) {
+                        app.dir.SetFileManualCategory(node, -1);
+                        app.SetNotice("Cleared override (using auto)");
+                    } else if (picked >= 0) {
+                        app.dir.SetFileManualCategory(node, picked);
+                        app.SetNotice(std::string("Override: ") +
+                                      Analysis::Name((Analysis::Category)picked));
+                    }
+                    continue;
+                }
 
                 // Unsaved-edits prompt: its buttons are clickable.
                 if (app.show_prompt) {
@@ -1159,7 +1785,10 @@ int main(int argc, char* argv[])
                         case Gui::MenuAction::Library: app.GuardedNav([&app]() { app.SwitchLibrary(); }); break;
                         case Gui::MenuAction::Analyse: app.AnalyseLibrary(); break;
                         case Gui::MenuAction::About:   app.show_about = !app.show_about; break;
-                        case Gui::MenuAction::Help:    app.show_help = !app.show_help; break;
+                        case Gui::MenuAction::Help:
+                            app.show_help = !app.show_help;
+                            if (app.show_help) app.help_page = 0;
+                            break;
                         default: break;
                     }
                     continue;
@@ -1172,6 +1801,7 @@ int main(int argc, char* argv[])
                     switch (dt) {
                         case Gui::DirTab::Folders:   app.dir.SetViewMode(Directory::ViewMode::Folder); break;
                         case Gui::DirTab::Category:  app.dir.SetViewMode(Directory::ViewMode::Category); break;
+                        case Gui::DirTab::Cluster:   app.dir.SetViewMode(Directory::ViewMode::Cluster); break;
                         case Gui::DirTab::ShowAll:   app.dir.SetHideDuplicates(false); break;
                         case Gui::DirTab::HideDupes: app.dir.SetHideDuplicates(true); break;
                         default: break;
@@ -1194,6 +1824,18 @@ int main(int argc, char* argv[])
                                   : "Bank EDIT off: Ctrl+key plays the slot");
                     continue;
                 }
+
+                // Tree scrollbar: clicking the thumb starts a drag; clicking
+                // the track above/below pages the view. Handled before the
+                // tree-row hit-test since the scrollbar sits inside the tree
+                // column.
+                char sb = gui.TreeScrollbarHit((int)event.button.x, (int)event.button.y);
+                if (sb == 't') {
+                    gui.BeginTreeScrollDrag((int)event.button.y);
+                    continue;
+                }
+                if (sb == 'a') { gui.PageTreeScroll(-1); continue; }
+                if (sb == 'b') { gui.PageTreeScroll(+1); continue; }
 
                 // Click a tree row: header collapses its category, folder
                 // expands/collapses, file selects + loads it.
@@ -1278,7 +1920,25 @@ int main(int argc, char* argv[])
             if (k == SDLK_SLASH && !app.editor.active) { app.BeginSearch(); continue; }
 
             // --- Global keys that work in both modes ---
-            if (k == SDLK_F1)  { app.show_help = !app.show_help; continue; }
+            if (k == SDLK_F1)  {
+                app.show_help = !app.show_help;
+                if (app.show_help) app.help_page = 0;
+                continue;
+            }
+            // Help is modal while open: left/right page, Esc closes, every
+            // other key is swallowed so the user can browse the overlay
+            // without accidentally triggering note playback / navigation.
+            if (app.show_help) {
+                if (k == SDLK_LEFT) {
+                    app.help_page = (app.help_page + Gui::kHelpPageCount - 1)
+                                     % Gui::kHelpPageCount;
+                } else if (k == SDLK_RIGHT) {
+                    app.help_page = (app.help_page + 1) % Gui::kHelpPageCount;
+                } else if (k == SDLK_ESCAPE) {
+                    app.show_help = false;
+                }
+                continue;
+            }
             if (k == SDLK_F11) { app.ToggleFullscreen(window); continue; }
             if (k == SDLK_F6)  {
                 app.editor.Toggle();
@@ -1288,6 +1948,21 @@ int main(int argc, char* argv[])
             if (k == SDLK_F7)  { app.AnalyseLibrary();      continue; }
             if (k == SDLK_F8)  { app.ToggleGrouping();      continue; }
             if (k == SDLK_F9)  { app.ToggleHideDuplicates(); continue; }
+            if (k == SDLK_F10) { app.ToggleClusterView();    continue; }
+            // Ctrl+R reclassifies the current instrument (cycles its manual
+            // override through the categories). Quick way to fix a misfiled
+            // file without leaving the keyboard. Ctrl+Shift+R clears every
+            // override library-wide.
+            {
+                bool ctrl  = (SDL_GetModState() & SDL_KMOD_CTRL)  != 0;
+                bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+                if (ctrl && shift && k == SDLK_R) { app.ClearAllOverrides(); continue; }
+                if (ctrl && k == SDLK_R)          { app.CycleManualCategory(); continue; }
+                // Ctrl+] / Ctrl+[ step the k-means cluster-count override
+                // for the next analysis run (0 = auto).
+                if (ctrl && k == SDLK_RIGHTBRACKET) { app.StepClusterCount(+1); continue; }
+                if (ctrl && k == SDLK_LEFTBRACKET)  { app.StepClusterCount(-1); continue; }
+            }
 
             if (app.editor.active) {
                 // ---------- EDIT MODE ----------
@@ -1400,7 +2075,7 @@ int main(int argc, char* argv[])
                     break;
 
                 case SDLK_LEFTBRACKET:
-                    app.octave_shift = std::max(-24, app.octave_shift - 12);
+                    app.octave_shift = std::max(-12, app.octave_shift - 12);
                     std::printf("Octave shift = %+d semitones\n", app.octave_shift); break;
                 case SDLK_RIGHTBRACKET:
                     app.octave_shift = std::min(+24, app.octave_shift + 12);
@@ -1435,6 +2110,7 @@ int main(int argc, char* argv[])
         gs.ntsc             = app.ntsc;
         gs.last_note_played = app.last_note_played;
         gs.show_help        = app.show_help;
+        gs.help_page        = app.help_page;
         gs.bank_cursor      = app.bank_cursor;
         gs.library_path     = app.library_path;
         gs.editor           = &app.editor;
@@ -1446,6 +2122,22 @@ int main(int argc, char* argv[])
         gs.search_active    = app.search_active;
         gs.search_query     = app.search_query;
         gs.bank_edit        = app.bank_edit;
+        gs.bank_menu_open   = app.bank_menu_open;
+        gs.bank_menu_slot   = app.bank_menu_slot;
+        gs.bank_menu_x      = app.bank_menu_x;
+        gs.bank_menu_y      = app.bank_menu_y;
+        gs.tree_menu_open   = app.tree_menu_open;
+        gs.tree_menu_node   = app.tree_menu_node;
+        gs.tree_menu_x      = app.tree_menu_x;
+        gs.tree_menu_y      = app.tree_menu_y;
+        gs.tree_menu_has_override = (app.tree_menu_node >= 0 &&
+            app.dir.GetFileManualCategory(app.tree_menu_node) >= 0);
+        gs.cat_picker_open  = app.cat_picker_open;
+        gs.cat_picker_node  = app.cat_picker_node;
+        gs.cat_picker_x     = app.cat_picker_x;
+        gs.cat_picker_y     = app.cat_picker_y;
+        gs.mouse_x          = app.mouse_x;
+        gs.mouse_y          = app.mouse_y;
         app.engine.SnapshotPokey(gs.pokey);
         gs.current_bank_slot = (app.current_source == App::Source::Bank)
                                    ? app.current_bank_slot : -1;

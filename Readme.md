@@ -44,10 +44,18 @@ is what you'll hear in RMT.
 
 **Browse a whole library at once**
 - Recursive folder scan of every `.RTI` under a directory.
-- Multiple list views: **Folders**, **Category**, **All**, and **No duplicates**.
+- Multiple list views: **Folders**, **By Category**, **All**, and **No dupes**.
 - **Type-to-search** filter bar to jump to an instrument by name.
 - Automatic **categorisation** (bass / lead / percussion / noise-FX / pad) and
   **duplicate detection** across the library.
+- **Directory scrollbar** with a draggable thumb on the right edge of the tree
+  pane — drag, click the track to page, or use arrow keys.
+- The category/folder containing the current selection auto-expands so the
+  highlighted instrument is never hidden under a collapsed parent.
+- **Right-click** any directory entry to drop it straight into the bank
+  (same effect as `+`, but without changing the instrument you're editing —
+  and sound-identical duplicates are detected and just highlighted rather
+  than re-added).
 - **Drag-and-drop** a folder or a single `.RTI` onto the window to load it.
 
 **Audition**
@@ -67,6 +75,11 @@ is what you'll hear in RMT.
 
 **Build a bank**
 - Curate a **64-slot bank**; copy / cut / paste / reorder slots in EDIT mode.
+- **Right-click any bank slot** for a context menu (New / Clear / Export RTI /
+  Import RTI) — build instruments from scratch, replace a slot in place, or
+  export a single slot to a standalone `.rti`. Clear and Export are greyed
+  out on empty slots; hovered items light up so it's obvious which option
+  you're about to pick.
 - Save the bank as a set of individual `.RTI` files **and** a single
   RMT-compatible **`.RMT`** module (plus a manifest).
 - **Reload** a saved bank, **switch libraries** on the fly, and resume where you
@@ -223,6 +236,24 @@ current instrument (so you can edit it).
 - `Ctrl+Del` — remove the **selected** slot. (Plain `Delete` does nothing to the
   bank, to avoid accidental deletions.)
 
+**Right-click context menu:** right-click any slot for a small popup with:
+
+- **New** — replace the slot with a fresh blank instrument (`PAR_TBL_SPEED=1`,
+  full-volume pulse on envelope column 0 so it's audible immediately), load it
+  as the current instrument, and drop straight into edit mode on its name.
+- **Clear** — wipe the slot (with a yes/no confirm). If the cleared slot was
+  the current instrument, the engine is silenced and its emulated-RAM page is
+  zeroed so a key press can't replay the stale data. Greyed out on empty slots.
+- **Export RTI** — save the slot's stored ATA blob to a standalone `.rti` file
+  via a Save dialog. Greyed out on empty slots.
+- **Import RTI** — load a `.rti` from disk directly into this slot (with a
+  confirm if the slot was occupied).
+
+Sound-identical duplicates are detected on every add: if you press `+` or
+right-click a directory entry whose ATA blob matches an existing bank slot,
+the bank cursor jumps to the existing slot and a notice tells you where —
+no second copy is created.
+
 Added or edited slots show **orange** until you save the bank, then turn green.
 
 **Saving:**
@@ -267,9 +298,16 @@ In Edit mode:
 - Arrow keys — move the cell cursor.
 - `0`–`9`, `A`–`F` — type a value (two-digit fields compose); `+` / `-` nudge by
   one.
+- **Mouse wheel** over the instrument panels (anywhere outside the directory
+  pane) also nudges the focused field by ±1 — handy for sweeping a single
+  parameter without leaving the mouse. Over the directory pane the wheel still
+  scrolls the instrument list.
 - **Right-click** any binary field — an AUDCTL flag, the table type/mode, or an
   envelope filter/portamento cell — to flip it between 0 and 1 instantly,
   without typing. (Left-click any field to put the cursor there.)
+- Switching to a different instrument **exits Edit mode**, fully stops any
+  ringing note, and silences the engine so the new instrument starts from a
+  clean slate.
 - In the **Name** panel, type to insert characters, `Backspace` / `Delete` to
   remove (hold to repeat), arrows to move the caret.
 - `Ctrl` + an audition key — hear the instrument you're editing at that pitch;
@@ -297,21 +335,222 @@ untouched when you switch.)
 
 ### Analysing & organising
 
-`F7` (or the **Analyse** menu button) scans every `.RTI` in the library and:
+PokeyForge analyses every `.RTI` in your library to:
 
-- **Finds duplicates** — two instruments are duplicates if their sound
+- **Find duplicates** — two instruments are duplicates if their sound
   definition is byte-identical, *regardless of filename or instrument name*.
   The first one (alphabetically) is kept; the rest are **hidden** from the
   browse list and tree. Your files are never deleted — `F9` shows/hides the
   duplicates again at any time.
-- **Categorises** each instrument (Bass / Lead / Percussion / Noise-FX / Pad /
+- **Categorise** each instrument (Bass / Lead / Percussion / Noise-FX / Pad /
   Other) from its parameters and envelope. `F8` toggles the directory pane
   between the normal **folder view** and a **grouped-by-category** view.
 
 The results are cached in `analysis.json` in the library folder, so the next
 time you open that library the categories and de-duplication are restored
-automatically. The classification is heuristic — treat the categories as a
-helpful rough grouping, not a strict taxonomy.
+automatically.
+
+**When analysis runs.** PokeyForge runs analysis automatically the **first
+time** a given library is opened (startup, `F4` Switch Library, or
+drag-dropping a folder onto the window) and **whenever the classifier has
+been bumped** since the cache was written. A *"Analysing instruments..."*
+splash appears while it works — typically a fraction of a second per
+hundred files. Subsequent opens with a matching version read the cached
+`analysis.json` instantly. **`F7`** (or the **Analyse** menu button) is an
+explicit re-run — use it after adding or removing files in the library
+folder.
+
+**Cache versioning.** `analysis.json` carries an integer `"version"` field
+that's compared against `Analysis::kAnalysisVersion` in the source. When we
+ship a release that changes the decision tree or adds a category, the
+constant bumps and your cached file is treated as missing — so every user's
+library gets re-analysed on the next launch without manual intervention.
+
+**How categorisation works.** PokeyForge runs each `.RTI` through a fixed
+set of heuristics over its parameters, envelope, and note table; the checks
+fire in order and the first match wins, so a single instrument can only land
+in one bucket. The 13 buckets are: **Bass / Lead / Lead (vibrato) / Arp /
+Chord / Pad / Bell / Kick / Snare / HiHat / Perc / Swept FX / Noise / FX /
+Other**.
+
+Signals used:
+
+| Signal | What it measures |
+|--------|------------------|
+| **Channel join** | `AUDCTL` bit `JOIN_1_2` or `JOIN_3_4` — POKEY pairs adjacent channels into a 16-bit-period bass voice. |
+| **Dominant distortion** | The most common POKEY distortion value (bits 1–3 of `AUDC`) across the *used* envelope columns. `0x0`/`0x8` are noise/poly; `0xA` is the pure tone (square pulse). |
+| **Distortion transient** | The distortion at the *first* column compared to the dominant of the rest — a snare hits with a pulse and rings out as noise; this signal catches that pattern. |
+| **High-frequency AUDCTL** | `15KHZ`, `179_CH1`, or `179_CH3` bits — POKEY's bell-like / bright modes. |
+| **Note table variation** | The number of distinct values in the used range of `noteTable[]`. ≥ 3 distinct values (or ≥ 2 across ≥ 3 entries) is an arp / chord. |
+| **Vibrato** | `PAR_VIBRATO` non-zero — periodic pitch wobble applied by the driver. |
+| **Filter sweep** | The `FILTER` envelope row is non-constant across the used columns. |
+| **Envelope length** | `PAR_ENV_LENGTH` — number of envelope columns the instrument actually plays through. |
+| **Loop point** | `PAR_ENV_GOTO < envLen` — does the envelope loop back to an earlier column instead of running once and stopping? |
+| **Volume fade** | `PAR_VOL_FADEOUT` — per-frame volume decay applied after the envelope ends. `≥ 8` is a fast fade (short tail). |
+| **Filename hint** | Common tokens in the file's name (`kick`, `snare`, `bd`, `hat`, `bass`, `lead`, `pad`, `arp`, `bell`, `fx`, ...) — used **only** when every other rule above has fallen through. |
+
+Decision tree (top-down, first match wins):
+
+1. **Channel join is on** → **Bass**.
+2. **Note table has ≥ 3 distinct values (or ≥ 2 with a length of ≥ 3)** → **Arp / Chord** (melodic pattern baked into the instrument).
+3. **High-frequency AUDCTL bit set AND distortion is pure tone (`0x0A`)** → **Bell** (bright tonal voices).
+4. **Envelope ≤ 5 columns AND fast fade** — drum-kit branch:
+    1. Distortion transient between start and tail (noise ↔ pulse) → **Snare**.
+    2. Dominant noise AND envelope ≤ 2 → **HiHat** (very short noise hit — hats, shakers, cymbals).
+    3. Non-noise distortion AND 2–5 columns → **Kick** (pulsey transient drum).
+    4. Anything else short + fast → **Perc** (claps, woodblocks, generic blips).
+5. **Filter row sweeps (non-constant) AND not looping** → **Swept FX**.
+6. **Dominant noise distortion** (longer than a drum hit) → **Noise / FX**.
+7. **Envelope loops AND not fading quickly** → **Pad** (sustaining tones).
+8. **Pure-tone dominant AND vibrato non-zero** → **Lead (vibrato)**.
+9. **Pure-tone dominant** → **Lead**.
+10. **Filename token matches** a known category keyword → that category.
+11. Everything else → **Other**.
+
+The classification is still heuristic — treat the categories as a helpful
+rough grouping, not a strict taxonomy. Authoritative definitions live in
+`src/Analysis.cpp` (`Analysis::Classify`).
+
+**Audio-rendered features (v3).** Beyond the parametric signals above,
+PokeyForge now also *renders* each instrument through the engine for
+~186 ms at startup-analysis time and pulls back audio features from the
+resulting PCM:
+
+| Feature | What it measures |
+|--------|------------------|
+| **RMS profile** (early / mid / late) | Volume envelope shape - peak-up-front + quiet tail = percussive; sustained mid+late = pad-like. |
+| **Zero-crossing rate** | Direct measure of noisiness from the rendered waveform. |
+| **Peak position** | Where the loudest sample sits in the window - 0 = attack-heavy, 1 = swelling. |
+| **Spectral centroid** | Brightness in Hz (mid-window FFT). Catches bell / mallet sounds whose AUDCTL bits aren't set but which sound bright via high-pitched note tables. |
+| **Spectral roll-off** | Frequency below which 85% of the signal energy sits. |
+| **Spectral flux** | Frame-to-frame magnitude change - high values mean an evolving / swept timbre. |
+
+These features are conservative: they refine the parametric tree but never
+override it on their own. They catch four specific cases the parametric
+rules miss: (a) percussive sounds with unusual envelope lengths; (b)
+ambiguous-distortion hits where ZCR confirms noise; (c) animated FX with no
+explicit FILTER envelope; (d) bright tonal voices whose AUDCTL didn't set
+the high-frequency mode.
+
+The audio thread is **paused** while analysis runs, so the shared engine
+isn't contended; the live instrument is reloaded when analysis finishes
+and audio resumes seamlessly. Analysis time is ~10-30 ms per instrument,
+so a 500-file library takes a few seconds. The splash shows a live
+**"N / M (X%)"** counter while it works.
+
+**Category colours.** Once a library is analysed, instrument rows in the
+directory tree are tinted by their effective category so you can see the
+mix at a glance without switching to *Category* view. The palette is
+deliberately soft — enough hue separation to read groupings, not enough
+to turn the pane into a rainbow:
+
+| Category | Colour |
+|---|---|
+| **Bass** | Cyan |
+| **Lead** | Amber |
+| **Lead (vibrato)** | Deeper amber |
+| **Arp** | Green-yellow |
+| **Chord** | Green |
+| **Glide** | Teal |
+| **Pad** | Soft purple |
+| **Bell** | Pale yellow |
+| **Kick** | Pink-red |
+| **Snare** | Salmon |
+| **HiHat** | Grey-pink |
+| **Perc** | Dusty rose |
+| **Swept FX** | Light blue-grey |
+| **Noise / FX** | Grey-blue |
+| **Other** / unanalysed | Default text grey |
+
+A row is **dimmed toward the panel background** when the classifier's
+confidence score is 1 (just one signal voted for the result) — those are
+your "manual review please" rows. The selection highlight always reads
+white-on-accent regardless.
+
+Two extra markers appear next to the file name:
+
+- **`B`** — this instrument is already in your bank.
+- **`M`** — this instrument has a **manual category override** (see below).
+  `B` takes precedence when both apply.
+
+**Clusters view.** Categories tell you *what kind* of instrument something
+is; clusters tell you *which other instruments it sounds like*. After
+analysis, PokeyForge runs **k-means** over the 8-dimensional audio-feature
+vector of every non-duplicate file and groups the library into N clusters
+of sonically-similar instruments. Features are standardised per dimension
+before clustering, so the result isn't dominated by whichever feature has
+the widest raw range; k-means++ seeding keeps the result deterministic.
+
+- **`F10`** (or the **Clusters** view-tab) groups the directory tree by
+  cluster instead of folder or category. Each header reads
+  `Cluster N (count)`; unclustered files (duplicates and any that the
+  audio render couldn't capture) land in a separate `(unclustered)`
+  group at the bottom.
+- The number of clusters defaults to `ceil(sqrt(N/2))` clamped to **[3,
+  12]** — small libraries get 3 clusters, very large libraries cap at 12.
+- **`Ctrl+]`** / **`Ctrl+[`** override the cluster count for the *next*
+  analysis run (the notice bar shows the active value). Press **F7** to
+  re-analyse with the new k. **`Ctrl+] … Ctrl+[ … Ctrl+[`** back to 0
+  goes back to the automatic choice.
+
+Two instruments in the same cluster mean the analyser's audio measurements
+(RMS shape, ZCR, spectral centroid / rolloff / flux) sit near each other
+in feature space — i.e., they share an overall sonic character, even if
+they have different POKEY parameters or live in different categories.
+
+**Manual overrides.** When the classifier puts a file in the wrong bucket,
+you can override it without re-running analysis:
+
+- **Right-click any directory file** → **Override category ▸** opens a
+  colour-coded picker listing every category plus a *Clear override
+  (auto)* row.
+- **`Ctrl+R`** on the current file cycles its category through every value
+  and then back to "use auto" — fast when you're flipping a few files
+  without leaving the keyboard.
+- **`Ctrl+Shift+R`** clears every manual override in the library at once
+  (with the count shown in the notice bar — there's no confirm, but
+  setting overrides again is trivial).
+
+Overrides are persisted as a `manual` field in `analysis.json` and survive
+across analysis re-runs. The tree shows an **`M`** marker next to
+overridden files; the instrument header's second line shows `Cat: Lead
+[M]` so you can see at a glance that the displayed category isn't the
+analyser's automatic guess.
+
+**Instrument header readout.** While an instrument is loaded, the panel
+header now shows a second line of analysis metadata:
+
+```
+Cat: Lead (conf 3)   Tags: bright, animated   Cent 2.1k  RMS 0.15  ZCR 0.22  Flux 0.08
+```
+
+- **Cat** — the effective category (manual override beats automatic).
+- **conf** — confidence (count of signals that voted for this category).
+  `[M]` appears after the category when an override is active.
+- **Tags** — the sub-tag bitmask, comma-separated. Tags are *orthogonal*
+  to the category and can include `vibrato`, `bright`, `dark`, `loud`,
+  `quiet`, `animated`, `highfreq`, `ascending`, `descending`.
+- **Cent / RMS / ZCR / Flux** — the four most informative audio features
+  cached from the analysis render (centroid in kHz, mean RMS across the
+  three windows, zero-crossing rate, spectral flux).
+
+The line is hidden when no analysis data is available yet (a freshly
+opened library before its first F7).
+
+**Search by tag.** The search bar accepts a special **`@tag`** syntax
+to filter by sub-tag instead of filename:
+
+- `@bright` — only instruments tagged bright.
+- `@bright,loud` — only instruments tagged **both** bright **and** loud
+  (AND semantics).
+- Plain queries (`kick`, `bass1`, …) still do case-insensitive substring
+  matching on filenames.
+
+**CSV export.** Every analysis run also writes an
+**`analysis_report.csv`** next to `analysis.json`, with one row per
+instrument (path, category, confidence, cluster, duplicate flag, tags,
+and all 8 audio features). Drop it into Excel / pandas / a script to
+slice your library outside the app.
 
 ### PAL vs NTSC
 
@@ -343,8 +582,11 @@ app.
 | `a`–`z`, `0`–`9` | Play the current instrument at chromatic pitches (low → high) |
 | `[` / `]` | Octave shift down / up |
 | `←` / `→` or `↑` / `↓` | Previous / next instrument (hold to repeat) |
-| Mouse wheel | Move the selection quickly (3 instruments per notch) |
+| Mouse wheel (over tree) | Move the selection quickly (3 instruments per notch) |
+| Mouse wheel (over edit panels) | Nudge the focused field by ±1 (Edit mode only) |
 | Click a tree row | Select that instrument (or expand a folder / collapse a category) |
+| Right-click a tree row | Add that instrument to the bank (dedups by ATA blob) |
+| Drag the directory scrollbar | Free-scroll the tree (click track above/below to page) |
 | `PageUp` / `PageDown` | Jump back / forward 10 instruments |
 | `Home` / `End` | First / last instrument |
 | `/` | Search — filter the list by name (type, `Enter` keeps it, `Esc` clears) |
@@ -364,6 +606,7 @@ app.
 | `Ctrl` + `a`–`z`/`0`–`9` | Sample (play) the selected bank slot |
 | `Ctrl+Ins` | Copy the current instrument into the selected slot (confirm if occupied) |
 | `Ctrl+Del` | Delete the selected slot (confirm) |
+| Right-click a slot | Open the context menu (New / Clear / Export RTI / Import RTI) |
 | **EDIT** button (bank panel) | Toggle bank-edit: when on, `Ctrl+C/X/V` move slots; when off they play |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | (EDIT on) copy / cut / paste a bank slot (cut + paste = move/reorder) |
 
@@ -395,6 +638,11 @@ app.
 | `F7` | Analyse: classify instruments + hide duplicates (writes `analysis.json`) |
 | `F8` | Toggle folder view / group-by-category |
 | `F9` | Show / hide duplicate instruments |
+| `F10` | Toggle Clusters view (k-means group-by-similarity) |
+| `Ctrl+R` | Reclassify the current file - cycle its manual override |
+| `Ctrl+Shift+R` | Clear every manual override in the library |
+| `Ctrl+]` / `Ctrl+[` | Increase / decrease the k-means cluster count (0 = auto) |
+| `@bright` in search | Filter by tag (combine with commas: `@bright,loud`) |
 | `F11` | Toggle fullscreen |
 | **About** button | Show the about / credits popup (any key or click closes it) |
 | Drag & drop | Drop a folder (open as library) or a `.RTI` (open its folder + select) onto the window |
@@ -442,7 +690,12 @@ and internals.
   `.RTI` files; reload banks; switch libraries; remember your place between
   sessions; in-place editing of parameters, envelope, note table, and name with
   live audition and **undo/redo**; bank slot sampling and Ctrl bank operations;
-  search, auto-categorisation, and duplicate detection.
+  search, auto-categorisation, and duplicate detection; **directory scrollbar**
+  with auto-expansion of the current selection's parent; **right-click context
+  menu** on bank slots (New / Clear / Export RTI / Import RTI) with hover
+  highlighting; right-click on a directory entry adds it to the bank (ATA-blob
+  deduplication); mouse wheel nudges edit fields when over the instrument
+  panels.
 - **Possible future work:** stereo (8-channel) playback, multi-voice/chord
   audition, and selectable RMT driver versions.
 

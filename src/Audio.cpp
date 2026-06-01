@@ -4,8 +4,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 
-Audio::Audio() = default;
+Audio::Audio() : m_scratch(16384, 0) {}
 
 Audio::~Audio() { Close(); }
 
@@ -50,6 +51,24 @@ void Audio::Close()
     m_engine = nullptr;
 }
 
+void Audio::Pause()
+{
+    m_paused.store(true, std::memory_order_release);
+    if (m_stream) SDL_PauseAudioStreamDevice(m_stream);
+}
+
+void Audio::Resume()
+{
+    if (m_stream) SDL_FlushAudioStream(m_stream);
+    m_paused.store(false, std::memory_order_release);
+    if (m_stream) SDL_ResumeAudioStreamDevice(m_stream);
+}
+
+void Audio::SetGain(float gain)
+{
+    if (m_stream) SDL_SetAudioStreamGain(m_stream, gain);
+}
+
 void SDLCALL Audio::CallbackThunk(void* userdata,
                                   SDL_AudioStream* stream,
                                   int additional_amount,
@@ -62,16 +81,17 @@ void SDLCALL Audio::CallbackThunk(void* userdata,
 void Audio::Callback(SDL_AudioStream* stream, int additional_amount)
 {
     if (!m_engine) return;
+    if (m_paused.load(std::memory_order_acquire)) return;
 
     while (additional_amount > 0) {
-        int want = std::min<int>(additional_amount, (int)sizeof(m_scratch));
-        int produced = m_engine->Generate(m_scratch, want);
+        int want = std::min<int>(additional_amount, (int)m_scratch.size());
+        int produced = m_engine->Generate(m_scratch.data(), want);
         if (produced <= 0) {
             // Engine couldn't produce: feed silence so SDL doesn't underrun.
-            std::memset(m_scratch, 0x80, want); // 0x80 = silence in U8
+            std::memset(m_scratch.data(), 0x80, (size_t)want); // 0x80 = silence
             produced = want;
         }
-        SDL_PutAudioStreamData(stream, m_scratch, produced);
+        SDL_PutAudioStreamData(stream, m_scratch.data(), produced);
         additional_amount -= produced;
     }
 }

@@ -13,6 +13,22 @@
 //
 // The on-disk format matches RMT's SaveInstrument(InstrumentIOType::RTI),
 // so the resulting files load cleanly via RMT's File > Load Instrument.
+//
+// Slot lifecycle:
+//   used=false   - empty slot; ata/name are default-constructed
+//   used=true,
+//   dirty=false  - mirrors what's on disk (saved or just loaded)
+//   used=true,
+//   dirty=true   - added/edited since last save; UI tints it orange.
+// MarkAllClean() flips dirty=false on every used slot after a successful
+// SaveTo / SaveRmt. Remove(slot) resets the slot to a fresh Slot{}, so
+// IsFull() and UsedCount() update automatically.
+//
+// Deduplication helpers (IndexOfPath/IndexOfAta) are pure lookups used by
+// the add code paths in main.cpp to avoid creating two slots that point to
+// the same source file (IndexOfPath) or hold the same sound info
+// (IndexOfAta, which is the strict comparison used for "+", right-click
+// add, and the bank-menu Import action).
 
 class Bank {
 public:
@@ -31,6 +47,10 @@ public:
 
     int  FirstEmptySlot() const;     // -1 if full
     int  IndexOfPath(const std::string& path) const;  // -1 if not present
+
+    // Find the first slot whose stored ATA blob byte-matches `ata` (i.e.,
+    // sound-identical, ignoring name/source). -1 if no match.
+    int  IndexOfAta(const std::vector<byte>& ata) const;
 
     // Add to the first empty slot. Returns the slot index, or -1 if the
     // bank is full or the file isn't valid.

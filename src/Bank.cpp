@@ -51,6 +51,14 @@ int Bank::IndexOfPath(const std::string& path) const
     return -1;
 }
 
+int Bank::IndexOfAta(const std::vector<byte>& ata) const
+{
+    for (int i = 0; i < SLOT_COUNT; ++i) {
+        if (m_slots[i].used && m_slots[i].ata == ata) return i;
+    }
+    return -1;
+}
+
 int Bank::Add(const RtiFile& rti)
 {
     if (!rti.Valid()) return -1;

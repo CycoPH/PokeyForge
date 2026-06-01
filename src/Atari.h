@@ -3,6 +3,8 @@
 #include "Types.h"
 #include "C6502.h"
 
+#include <memory>
+
 // 64 KB Atari memory + helpers for JSR-ing into 6502 code.
 // MFC-free port of RMT's CAtari/Atari.h, scoped to PokeyForge's needs.
 
@@ -37,7 +39,8 @@ public:
     void JSR(MemoryAddress addr, byte& a, byte& x, byte& y);
 
 private:
-    byte  m_memory[MEMORY_SIZE];
+    // Heap-allocated so the 64 KB doesn't sit in main's stack frame.
+    std::unique_ptr<byte[]> m_memory;
     bool  m_ntsc = false;
     bool  m_cpu_loaded = false;
 };
