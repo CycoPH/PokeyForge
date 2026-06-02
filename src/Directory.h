@@ -120,6 +120,13 @@ public:
     void ClearAnalysis();
     void RebuildViews();
 
+    // Derive a short "what's in this cluster" label from the member files'
+    // categories + mean audio features. Used by the Cluster view to give
+    // each numbered cluster a human-readable suffix (e.g. "Cluster 3 -
+    // Bass + Pad (dark, sustained)"). Returns the descriptive part only -
+    // the caller adds the "Cluster N - " prefix and the "(count)" suffix.
+    std::string ClusterCharacterLabel(const std::vector<int>& member_files) const;
+
     // Collapse/expand a category group in Category view (cat == category
     // count means the "(unanalysed)" group).
     void ToggleCategoryCollapsed(int cat);

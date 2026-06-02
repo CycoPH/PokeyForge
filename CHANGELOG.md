@@ -5,6 +5,191 @@ All notable changes to **PokeyForge** are tracked in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-06-02
+
+### Added
+- **JetBrains Mono font via SDL3_ttf.** Replaces SDL3's 8×8 debug-text
+  glyphs with a properly hinted monospace font (ptsize=13). Sharper at
+  every panel; the per-glyph width is unchanged so existing geometry
+  still snaps to the same column grid. New runtime dependencies:
+  `SDL3_ttf.dll` (1.9 MB) and `JetBrainsMono-Regular.ttf` (267 KB),
+  both bundled by `release.ps1`.
+- **Bank navigation loads the focused slot.** `Ctrl+Left/Right/Up/Down`
+  on the bank steps the cursor and, when the new slot is occupied,
+  loads that instrument into the editor panels - same effect as
+  left-clicking the slot. Empty slots are still skipped over without
+  touching what's currently loaded, so you can walk across gaps
+  without losing an in-flight edit. Audition via `Ctrl+letter` is
+  unchanged (no load). Tab cycling still just moves the cursor.
+- **Mono/Stereo toggle in the volume-envelope popup.** Top-right corner
+  of the big vol popup, mirrors the toggle on the Envelope panel
+  header. Lets you flip the working instrument between mono and
+  stereo without leaving the popup.
+- **Stereo copy buttons in the vol popup.** `↑` / `↓` buttons between
+  the VolR and VolL sections copy the entire envelope between
+  channels in one undoable operation. Only visible in stereo mode.
+- **Goto-column drag handle in the vol popup.** A draggable
+  `Goto: N` strip at the bottom of the popup sets `PAR_ENV_GOTO`
+  live - drop the thumb to commit one undo entry for the whole drag.
+
+### Changed
+- **Mono is the default load mode.** New / loaded / bank-slot
+  instruments come up in mono regardless of the stored ATA encoding;
+  use the `Mono` / `Stereo` toggle to switch when needed. Previously
+  the encoding bit drove the mode, which surprised users who didn't
+  realise they'd loaded a stereo instrument.
+- **Bidirectional VolL ↔ VolR mirror in mono.** Any change to a
+  volume cell in mono mode now propagates to the other channel,
+  regardless of how the change arrived: hex digit typing (`0-9 A-F`),
+  `+` / `-` nudges, `Shift+Up`/`Down`, scroll-wheel nudges, envelope
+  grid drag-paint, or vol-popup drag-paint. Previously only the vol
+  popup's drag-paint mirrored VolL → VolR, so editing VolR cells via
+  the keyboard left the two channels out of sync.
+- **Mono/Stereo toggle labels** now read `Mono` / `Stereo` (were `MN`
+  / `ST`). Wider button (`GlyphW × 6 + 8 px`) accommodates the full
+  word; the hit-test and mini-vol-strip extents follow the new width.
+- **Vol popup shows both VolR and VolL sections in mono.** Previously
+  mono mode collapsed the popup to one section; both are now drawn
+  regardless of stereo state so the popup geometry stays stable
+  through a Mono/Stereo flip.
+- **Envelope header layout.** The `[EDITING - Tab to switch]` hint
+  used to live next to the section title, on the left side, where
+  its width overlapped the mini-volume graph. Moved next to the
+  Mono/Stereo toggle on the right; the title stays a short
+  `Envelope` and the underline always spans the full header width
+  whether or not the panel is being edited.
+- **Mini vol graph clipping.** Long envelopes used to draw vol bars
+  on top of the toggle button (and now the EDITING hint). The strip
+  now clips at the right-hand controls' left edge - baseline, bars,
+  and the goto marker all stop short.
+
+### Fixed
+- **Volume popup hit detection** for stereo mode (popup stereo
+  param, 16-zone value map, mono Y-offset reconciled with the
+  always-both-sections layout from session 3).
+- **Envelope panel section title underline** is back at the full
+  header width when editing - previously the underline was
+  shortened (because the title temporarily included the editing
+  hint) and visually disconnected from the rest of the header.
+
+## [1.2.0] - 2026-06-01
+
+### Added
+
+**Audio-feature extraction is back.** The v1.1 "audio features disabled"
+known limitation is solved. A patched `sa_pokey.dll` now exposes the
+Altirra audio mixer's internal float-sample stream so PokeyForge can
+fingerprint instruments at the engine's native ~64 kHz mix rate without
+going through `Pokey_Process`'s memset-to-silence buffer. The full
+12,791-instrument bundled library re-analyses in ~9 seconds on a desktop
+CPU — over 250× realtime.
+
+- **`Pokey_SetAudioTap` / `Pokey_SetMute` / `Pokey_GetAnalysisAbiVersion`**
+  added to `sa_pokey.dll`. PokeyForge installs a tap pointing at the
+  mixer's internal stream; the existing RMT plugin contract
+  (`Pokey_Process`, `Pokey_SoundInit`, `Pokey_PutByte`, etc.) is
+  unchanged so the DLL still works as a drop-in for vanilla RMT.
+- **Vendored AltirraSDL source under `extras/sa_pokey-src/`.** ~3 MB
+  of the minimal upstream slice (`AltirraRMTPOKEY`, `ATAudio`, `ATCore`,
+  `system`, public headers, build .props), plus a one-button
+  `build.ps1` that rebuilds the patched DLL from a clean checkout and
+  drops it into `runtime/`. The full upstream patch is also kept as
+  `patches/rmtinterface.cpp.patch` for audit. Build outputs are
+  `.gitignore`d. See `extras/sa_pokey-src/README.md` for license and
+  refresh notes.
+- **Smoke-test CLI** — `PokeyForge.exe --smoke-tap <out.raw>` drives
+  the engine through a known square-wave configuration and dumps the
+  captured float samples to disk. Used to verify the tap is wired
+  correctly without needing the GUI.
+- **Audio path rewritten.** Playback now drains the audio tap into
+  PokeyForge's SDL3 output stream as **explicit stereo** (mono samples
+  duplicated to both channels), and **mutes the DLL's own native audio
+  device**. Eliminates the only-on-one-speaker regression some users
+  saw with the new DLL and gives PokeyForge full control of the audio
+  output.
+- **Cluster view UX overhaul.**
+  - Cluster headers start **collapsed** (previously expanded). Click
+    a header to toggle just that cluster; the cluster containing the
+    current selection auto-expands.
+  - **Hover-tooltip on truncated cluster headers** — full label
+    wraps to two lines inside the tree pane.
+  - **Generated cluster names.** Numbered clusters now carry a
+    descriptive suffix derived from member files:
+    `Cluster 3 - Bass + Pad (dark, sustained) (24)`. Names are
+    computed at view-build time from majority categories and the
+    same adjective vocabulary as the per-file tags (bright / dark /
+    loud / quiet / percussive / sustained / animated / noisy).
+- **`k_override` persisted in `analysis.json`.** The k-means cluster
+  count you set with `Ctrl+]` / `Ctrl+[` now survives across launches.
+  Default bumped from `0` (auto, capped at 12) to **`24`**, which
+  produces useful sub-groups on multi-thousand-instrument libraries.
+- **6-page F1 help** (was 4 in v1.1). Pages: Keybindings, Categories &
+  analysis, Search syntax, **Clusters** (expanded with cluster naming
+  + adjective table), **Spectral signature panel** (now a dedicated
+  page with typical-signature shapes for Kick / HiHat / Pad / Bass /
+  Sweep / Bell), **Editor** (new — covers F6 edit mode in depth:
+  panels, cursor movement, hex compose, audition while editing,
+  Ctrl+Z/Y/S semantics). **Mouse wheel** now pages through the help
+  when the cursor is over the panel.
+- **Bank slot right-click menu** gains an **Analyse** action and an
+  always-visible cluster-info section at the bottom:
+  - **Analyse** renders the slot's current ATA through the engine,
+    classifies it against the library's existing cluster centroids,
+    and shows `Cluster N - <label>` + `Members: X` inline (menu
+    stays open).
+  - Empty / never-analysed slots show **None**. Result is cached
+    per-slot and keyed on ATA hash, so subsequent menu opens are
+    instant — unless the slot was edited / imported / pasted, in
+    which case the cache auto-invalidates back to None.
+- **Bank-wide Analyse button** on the bank title row (left of `EDIT`).
+  One click runs the per-slot analysis loop across every used slot;
+  notice bar reports `Bank Analyse: N / M slots clustered` when done.
+- **Cluster fingerprints persist with the bank.** `Bank::Slot` now
+  carries `cluster_info` + `cluster_hash` fields. `manifest.txt`
+  gains two trailing TSV columns (`cluster_info`, `cluster_hash`);
+  newlines in `cluster_info` are escaped as `\n` so the format stays
+  one-line-per-slot. Both columns are optional - bank folders
+  written by older PokeyForge or never analysed simply omit them.
+  Reload preserves cluster info even across PokeyForge restarts.
+- **One-popup-at-a-time + ESC closes popups.** Opening the bank menu
+  while the tree menu is open closes the tree menu first (and vice
+  versa). ESC dismisses any open right-click popup before falling
+  through to the editor's exit / playback silence.
+- **Bank Ctrl shortcuts gated by Bank EDIT mode.** `Ctrl+C/X/V`
+  (already gated in v1.1) and now `Ctrl+Y` / `Ctrl+S` only fire when
+  the bank EDIT toggle is on. Outside EDIT mode they fall through to
+  `Ctrl+letter` audition so you can no longer accidentally trigger
+  Export / Redo when you meant to play the `S` or `Y` chromatic note.
+  `Ctrl+Z` (Undo) stays universal.
+
+### Changed
+- **Classifier bumped to v7.** Analysis cache version is `7`; existing
+  v6 caches auto-regenerate on load. v6 caches' all-zero audio rows
+  are replaced with real spectral data; tags `bright`, `dark`, `loud`,
+  `quiet`, `animated` become populated; k-means clustering produces
+  real groups instead of dumping every file into `(unclustered)`.
+- **Pokey emulator mix rate documented** as ~63920 Hz NTSC / 63337 Hz
+  PAL (`cps / 28`) — this is the rate audio features are computed at,
+  not 44.1 kHz as in the v1.1 code (which never worked).
+- **Bank EDIT toggle notice** now reads
+  `Ctrl+C/X/V/Y/S edit, Ctrl+key still moves cursor` so the wider
+  shortcut gate is discoverable from the UI.
+
+### Fixed
+- **Cluster view rows can be individually toggled.** v1.1 had the
+  collapse-all routine but no per-header click dispatcher in the
+  Cluster view — clicking a header did nothing. Routed properly now.
+
+### Documentation
+- New `extras/sa_pokey-src/README.md` covering rebuild, license
+  (GPLv2 + RMT exception for the Altirra plugins, zlib for `system/`),
+  and how to refresh against a newer upstream.
+- Readme's cluster section now documents the `k_override` default of
+  24, the persistence in `analysis.json`, the descriptive cluster
+  labels, and the hover-tooltip behaviour.
+- Removed the v1.1 "Known limitations: audio features disabled"
+  section; everything described there now works.
+
 ## [1.1.0] - 2026-05-31
 
 ### Added

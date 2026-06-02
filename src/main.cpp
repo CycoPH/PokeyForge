@@ -7,7 +7,9 @@
 #include "Directory.h"
 #include "Editor.h"
 #include "Gui.h"
+#include "TextRenderer.h"
 #include "Keyboard.h"
+#include "Pokey.h"
 #include "RmtEngine.h"
 #include "RtiFile.h"
 #include "Version.h"
@@ -16,7 +18,9 @@
 #include <SDL3/SDL_main.h>   // provides the Windows entry point (no console)
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -155,6 +159,19 @@ std::string LocateDriverObx()
     std::vector<fs::path> roots;
     const char* base = SDL_GetBasePath();
     if (base && *base) roots.emplace_back(base);
+#ifdef _WIN32
+    // SDL_GetBasePath returns null when SDL hasn't been initialised yet (the
+    // --analyse path runs before SDL_Init). Fall back to GetModuleFileName so
+    // headless analysis still finds the .obx beside the .exe.
+    {
+        char exe[MAX_PATH];
+        DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            fs::path p(exe);
+            roots.push_back(p.parent_path());
+        }
+    }
+#endif
     roots.push_back(fs::current_path());
 
     for (const auto& root : roots) {
@@ -291,6 +308,40 @@ struct App {
     int          bank_menu_slot = -1;
     int          bank_menu_x = 0;
     int          bank_menu_y = 0;
+    // What the bank menu currently displays in its bottom info section.
+    // Pulled from the slot's cached cluster_info on menu open; rewritten
+    // when the user clicks "Analyse". Empty string is rendered as "None".
+    // The actual per-slot cache lives on Bank::Slot (cluster_info /
+    // cluster_hash) so it serialises through manifest.txt with the bank.
+    std::string  bank_menu_cluster_info;
+
+    // Envelope horizontal drag-paint state.
+    // The user holds the left mouse button down and drags across envelope cells;
+    // every cell in the same row gets stamped with the value of the first cell
+    // that was clicked.  Binary rows (Filt / Port) toggle on click and then
+    // paint the toggled value.  A single undo entry is pushed for the whole
+    // drag on mouse-up.
+    bool         drag_paint_active   = false;
+    int          drag_paint_row      = 0;
+    int          drag_paint_value    = 0;
+    int          drag_paint_last_col = -1;
+    bool         drag_paint_changed  = false;
+    TInstrument  drag_paint_start{};
+
+    // Volume popup bar-drag state.  A drag in the popup is collapsed into a
+    // single undo entry (same as envelope drag-paint).
+    bool         vol_drag_active  = false;
+    bool         vol_drag_changed = false;
+    TInstrument  vol_drag_start{};
+
+    // Whether the current instrument is treated as stereo (independent VolR/VolL)
+    // or mono (VolR is a mirror of VolL).  Auto-detected on load; toggled by the
+    // stereo button in the envelope section header.
+    bool         instr_stereo = false;
+
+    // Goto-handle drag in the vol popup.
+    bool         vol_goto_drag_active = false;
+    TInstrument  vol_goto_drag_start{};
 
     // Directory-tree right-click context menu.
     bool         tree_menu_open = false;
@@ -311,7 +362,11 @@ struct App {
 
     // Manual k-means cluster count override for the next analysis run.
     // 0 = use the automatic choice (ceil(sqrt(N/2)) clamped to [3,12]).
-    int          k_clusters_override = 0;
+    // K-means cluster count for the next analysis (0 = auto). Default is
+    // Analysis::kDefaultKOverride (24, tuned for multi-thousand-instrument
+    // libraries). Persisted across runs via analysis.json's "k_override"
+    // field and restored by LoadOrRunAnalysis when a cache loads.
+    int          k_clusters_override = Analysis::kDefaultKOverride;
 
     void AskConfirm(const std::string& msg, std::function<void()> action)
     {
@@ -367,7 +422,8 @@ struct App {
         engine.LoadInstrumentSlot(kInstrSlot,
                                   current_rti.AtaBlob().data(),
                                   current_rti.AtaBlob().size());
-        current_instr_valid = current_rti.ToInstrument(current_instr, /*stereo=*/false);
+        instr_stereo = false;
+        current_instr_valid = current_rti.ToInstrument(current_instr, instr_stereo);
         working_ata    = current_rti.AtaBlob();
         modified       = false;
         current_source = Source::Directory;
@@ -396,7 +452,8 @@ struct App {
         last_note_played = -1;
         editor.SetActive(false);
         engine.LoadInstrumentSlot(kInstrSlot, s.ata.data(), s.ata.size());
-        current_instr_valid = DecodeAta(s.ata, current_instr);
+        instr_stereo = false;
+        current_instr_valid = DecodeAta(s.ata, current_instr, instr_stereo);
         // The decoder blanks the name (the ATA blob has none); restore it from
         // the bank slot so the header and later commits keep the real name.
         if (current_instr_valid) {
@@ -419,7 +476,7 @@ struct App {
 
     // Decode an ATA blob into a TInstrument by wrapping it in an in-memory
     // .RTI image and reusing the existing parser.
-    static bool DecodeAta(const std::vector<byte>& ata, TInstrument& out)
+    static bool DecodeAta(const std::vector<byte>& ata, TInstrument& out, bool stereo = false)
     {
         std::vector<byte> img;
         img.reserve(4 + 33 + 1 + ata.size());
@@ -429,7 +486,23 @@ struct App {
         img.insert(img.end(), ata.begin(), ata.end());
         RtiFile tmp;
         if (!tmp.LoadFromMemory(img.data(), img.size())) return false;
-        return tmp.ToInstrument(out, /*stereo=*/false);
+        return tmp.ToInstrument(out, stereo);
+    }
+
+    // Inspect an ATA blob and return true when any envelope step has a different
+    // high nibble (VolR) and low nibble (VolL), indicating stereo content.
+    static bool DetectStereoFromAta(const std::vector<byte>& ata)
+    {
+        // ATA layout: [env_start_idx] [goto_idx] [env_end_idx] [step0] [step1] ...
+        // Each step is 3 bytes: [VolByte] [DistByte] [CmdByte]
+        if (ata.size() < 4) return false;
+        int env_start = (int)(unsigned char)ata[0];
+        int env_end   = (int)(unsigned char)ata[2];
+        for (int p = env_start; p <= env_end && p + 2 < (int)ata.size(); p += 3) {
+            unsigned char b = (unsigned char)ata[p];
+            if ((b >> 4) != (b & 0x0F)) return true;
+        }
+        return false;
     }
 
     void PlayNote(int semitone)
@@ -477,7 +550,7 @@ struct App {
     {
         if (!current_instr_valid) { SetNotice("No instrument to insert"); return; }
         if (slot < 0 || slot >= Bank::SLOT_COUNT) return;
-        working_ata = RtiFile::InstrumentToAta(current_instr, /*stereo=*/false);
+        working_ata = RtiFile::InstrumentToAta(current_instr, instr_stereo);
         bank.SetSlot(slot, TrimName(), working_ata,
                      current_rti.Valid() ? current_rti.Path() : "");
         bank_cursor = slot;
@@ -523,7 +596,7 @@ struct App {
     void ApplyEdit()
     {
         if (!current_instr_valid) return;
-        working_ata = RtiFile::InstrumentToAta(current_instr, /*stereo=*/false);
+        working_ata = RtiFile::InstrumentToAta(current_instr, instr_stereo);
         engine.LoadInstrumentSlot(kInstrSlot, working_ata.data(), working_ata.size());
         modified = true;
         if (current_source == Source::Bank && current_bank_slot >= 0) {
@@ -536,7 +609,7 @@ struct App {
     bool CommitToBank()
     {
         if (!current_instr_valid) return false;
-        working_ata = RtiFile::InstrumentToAta(current_instr, false);
+        working_ata = RtiFile::InstrumentToAta(current_instr, instr_stereo);
         std::string name = TrimName();   // working name (reflects edits)
         std::string path = current_rti.Valid() ? current_rti.Path() : "";
 
@@ -619,18 +692,47 @@ struct App {
         if (undo_stack.size() > 128) undo_stack.erase(undo_stack.begin());
     }
 
+    // In mono mode, VolL and VolR share one value per envelope column.
+    // After an edit that touched exactly one of the two channels we
+    // propagate the new value to the other so the two stay locked
+    // together regardless of how the change came in (hex digit, +/-
+    // nudge, scroll wheel, drag-paint, etc). Columns where both changed
+    // (the unusual case where the same edit hit both rows) are left
+    // alone - they were presumably already in sync.
+    void MirrorVolMonoAfterEdit(const TInstrument& before)
+    {
+        if (instr_stereo) return;
+        for (int c = 0; c < ENVELOPE_MAX_COLUMNS; ++c) {
+            int l_before = before.envelope[c][VOLUMEL];
+            int l_after  = current_instr.envelope[c][VOLUMEL];
+            int r_before = before.envelope[c][VOLUMER];
+            int r_after  = current_instr.envelope[c][VOLUMER];
+            bool l_changed = (l_after != l_before);
+            bool r_changed = (r_after != r_before);
+            if (l_changed && !r_changed)
+                current_instr.envelope[c][VOLUMER] = l_after;
+            else if (r_changed && !l_changed)
+                current_instr.envelope[c][VOLUMEL] = r_after;
+        }
+    }
+
     // Run an editor action; if it changed the instrument, record undo + apply.
     template <typename Fn>
     void DoEdit(Fn&& fn)
     {
         TInstrument before = current_instr;
-        if (fn()) { PushUndo(before); redo_stack.clear(); ApplyEdit(); }
+        if (fn()) {
+            MirrorVolMonoAfterEdit(before);
+            PushUndo(before);
+            redo_stack.clear();
+            ApplyEdit();
+        }
     }
 
     // Push the current working instrument live to the engine + bank slot.
     void ReencodeLive()
     {
-        working_ata = RtiFile::InstrumentToAta(current_instr, /*stereo=*/false);
+        working_ata = RtiFile::InstrumentToAta(current_instr, instr_stereo);
         engine.LoadInstrumentSlot(kInstrSlot, working_ata.data(), working_ata.size());
         if (current_source == Source::Bank && current_bank_slot >= 0)
             bank.SetSlot(current_bank_slot, TrimName(), working_ata,
@@ -638,7 +740,252 @@ struct App {
         editor.Clamp(current_instr);
     }
 
+    void ToggleStereo()
+    {
+        instr_stereo = !instr_stereo;
+        ReencodeLive();
+        SetNotice(instr_stereo ? "Stereo mode" : "Mono mode");
+    }
+
     void ToggleField()         { DoEdit([&]{ return editor.ToggleBinary(current_instr); }); }
+
+    // Cycle a small-range param (maxv ≤ 3, not binary) forward by one step.
+    void CycleField()
+    {
+        if (!editor.active || editor.panel != Editor::Panel::Params) return;
+        int pi, maxv; bool flag;
+        Editor::ParamCell(editor.param_idx, pi, maxv, flag);
+        if (maxv < 2 || maxv > 3) return;   // binary handled by ToggleField; >3 = use keyboard
+        DoEdit([&]{
+            int nv = (current_instr.parameters[pi] + 1) % (maxv + 1);
+            if (nv == current_instr.parameters[pi]) return false;
+            current_instr.parameters[pi] = nv;
+            return true;
+        });
+    }
+
+    // Begin drag-paint on an envelope cell.  Binary rows (Filt / Port) are
+    // toggled on click; the toggled value becomes the paint stamp.
+    // In mono mode, dragging a vol cell mirrors to the other vol row at
+    // the same column so VolL/VolR stay locked together. Called from the
+    // env drag-paint hot path - kept inline-cheap; the no-op branches
+    // dominate (drag-paint on FILTER/PORTAMENTO/DIST etc. never touches
+    // the vol rows).
+    void MirrorVolMonoCell(int col, int row)
+    {
+        if (instr_stereo) return;
+        if (col < 0 || col >= ENVELOPE_MAX_COLUMNS) return;
+        if (row == VOLUMEL)
+            current_instr.envelope[col][VOLUMER] = current_instr.envelope[col][VOLUMEL];
+        else if (row == VOLUMER)
+            current_instr.envelope[col][VOLUMEL] = current_instr.envelope[col][VOLUMER];
+    }
+
+    void BeginEnvDragPaint(int col, int row)
+    {
+        if (!current_instr_valid) return;
+        drag_paint_row      = row;
+        drag_paint_last_col = col;
+        drag_paint_changed  = false;
+        drag_paint_start    = current_instr;
+        drag_paint_active   = true;
+        EnterEditField(Editor::Panel::Envelope, col, row);
+        // Binary rows toggle the clicked cell first; the new value becomes the stamp.
+        bool is_binary = (row == FILTER || row == PORTAMENTO);
+        if (is_binary) {
+            int old_val = current_instr.envelope[col][row];
+            int new_val = old_val ? 0 : 1;
+            current_instr.envelope[col][row] = new_val;
+            MirrorVolMonoCell(col, row);
+            drag_paint_value = new_val;
+            drag_paint_changed = true;
+            ApplyEdit();
+        } else {
+            drag_paint_value = current_instr.envelope[col][row];
+        }
+    }
+
+    // Continue painting during mouse motion (same row, left button held).
+    void ContinueEnvDragPaint(int col, int row)
+    {
+        if (!drag_paint_active || row != drag_paint_row) return;
+        if (col == drag_paint_last_col) return;
+        int env_len = current_instr.parameters[PAR_ENV_LENGTH];
+        if (col < 0 || col > env_len) return;
+        drag_paint_last_col = col;
+        if (current_instr.envelope[col][row] == drag_paint_value) return;
+        current_instr.envelope[col][row] = drag_paint_value;
+        MirrorVolMonoCell(col, row);
+        drag_paint_changed = true;
+        ApplyEdit();
+        editor.env_col = col;
+        editor.env_row = row;
+    }
+
+    // End drag-paint; push a single undo entry for the whole stroke.
+    void EndEnvDragPaint()
+    {
+        if (!drag_paint_active) return;
+        drag_paint_active = false;
+        if (drag_paint_changed) {
+            PushUndo(drag_paint_start);
+            redo_stack.clear();
+        }
+    }
+
+    // Volume popup bar-drag: set a specific envelope cell value from mouse position.
+    void BeginVolDrag(int col, int row, int value)
+    {
+        if (!current_instr_valid) return;
+        vol_drag_start   = current_instr;
+        vol_drag_active  = true;
+        vol_drag_changed = false;
+        int env_len = current_instr.parameters[PAR_ENV_LENGTH];
+        if (col < 0 || col > env_len || row < 0 || row >= ENVROWS) return;
+        current_instr.envelope[col][row] = std::clamp(value, 0, 15);
+        if (!instr_stereo) {
+            if (row == VOLUMEL)
+                current_instr.envelope[col][VOLUMER] = current_instr.envelope[col][VOLUMEL];
+            else
+                current_instr.envelope[col][VOLUMEL] = current_instr.envelope[col][VOLUMER];
+        }
+        vol_drag_changed = true;
+        ApplyEdit();
+        editor.env_col = col;
+        editor.env_row = row;
+    }
+
+    void ContinueVolDrag(int col, int row, int value)
+    {
+        if (!vol_drag_active || !current_instr_valid) return;
+        int env_len = current_instr.parameters[PAR_ENV_LENGTH];
+        if (col < 0 || col > env_len || row < 0 || row >= ENVROWS) return;
+        int v = std::clamp(value, 0, 15);
+        if (current_instr.envelope[col][row] == v) return;
+        current_instr.envelope[col][row] = v;
+        if (!instr_stereo) {
+            if (row == VOLUMEL)
+                current_instr.envelope[col][VOLUMER] = current_instr.envelope[col][VOLUMEL];
+            else
+                current_instr.envelope[col][VOLUMEL] = current_instr.envelope[col][VOLUMER];
+        }
+        vol_drag_changed = true;
+        ApplyEdit();
+        editor.env_col = col;
+        editor.env_row = row;
+    }
+
+    void EndVolDrag()
+    {
+        if (!vol_drag_active) return;
+        vol_drag_active = false;
+        if (vol_drag_changed) {
+            PushUndo(vol_drag_start);
+            redo_stack.clear();
+        }
+    }
+
+    // Apply a new goto column value, clamped to valid range.
+    void ApplyGotoCol(int col)
+    {
+        int env_len = current_instr.parameters[PAR_ENV_LENGTH];
+        col = std::clamp(col, 0, env_len);
+        if (current_instr.parameters[PAR_ENV_GOTO] == col) return;
+        current_instr.parameters[PAR_ENV_GOTO] = col;
+        ApplyEdit();
+    }
+
+    void BeginGotoDrag(int col)
+    {
+        if (!current_instr_valid) return;
+        vol_goto_drag_start  = current_instr;
+        vol_goto_drag_active = true;
+        ApplyGotoCol(col);
+    }
+
+    void ContinueGotoDrag(int col)
+    {
+        if (!vol_goto_drag_active || !current_instr_valid) return;
+        ApplyGotoCol(col);
+    }
+
+    void EndGotoDrag()
+    {
+        if (!vol_goto_drag_active) return;
+        vol_goto_drag_active = false;
+        if (current_instr.parameters[PAR_ENV_GOTO] !=
+            vol_goto_drag_start.parameters[PAR_ENV_GOTO]) {
+            PushUndo(vol_goto_drag_start);
+            redo_stack.clear();
+        }
+    }
+
+    // Copy all VolL values to VolR (^ button: VolL -> VolR).
+    void CopyVolLToVolR()
+    {
+        if (!current_instr_valid) return;
+        TInstrument before = current_instr;
+        int env_len = current_instr.parameters[PAR_ENV_LENGTH];
+        bool changed = false;
+        for (int c = 0; c <= env_len; ++c) {
+            byte v = current_instr.envelope[c][VOLUMEL];
+            if (current_instr.envelope[c][VOLUMER] != v) {
+                current_instr.envelope[c][VOLUMER] = v;
+                changed = true;
+            }
+        }
+        if (changed) { PushUndo(before); redo_stack.clear(); ApplyEdit(); }
+    }
+
+    // Copy all VolR values to VolL (v button: VolR -> VolL).
+    void CopyVolRToVolL()
+    {
+        if (!current_instr_valid) return;
+        TInstrument before = current_instr;
+        int env_len = current_instr.parameters[PAR_ENV_LENGTH];
+        bool changed = false;
+        for (int c = 0; c <= env_len; ++c) {
+            byte v = current_instr.envelope[c][VOLUMER];
+            if (current_instr.envelope[c][VOLUMEL] != v) {
+                current_instr.envelope[c][VOLUMEL] = v;
+                changed = true;
+            }
+        }
+        if (changed) { PushUndo(before); redo_stack.clear(); ApplyEdit(); }
+    }
+
+    // Reload from disk and discard all unsaved edits + both stacks.
+    void RevertFromDisk()
+    {
+        if (current_source == Source::Bank) {
+            // Bank slots have no on-disk source to revert to; re-decode ATA.
+            if (current_bank_slot >= 0 && bank.At(current_bank_slot).used) {
+                TInstrument reverted{};
+                const auto& slot = bank.At(current_bank_slot);
+                if (DecodeAta(slot.ata, reverted)) {
+                    current_instr = reverted;
+                    current_instr_valid = true;
+                }
+            }
+        } else {
+            // Directory source: reload from disk.
+            RtiFile fresh;
+            if (fresh.LoadFromFile(current_rti.Path().c_str())) {
+                current_rti = fresh;
+                instr_stereo = false;
+                current_instr_valid = current_rti.ToInstrument(current_instr, instr_stereo);
+            }
+        }
+        undo_stack.clear();
+        redo_stack.clear();
+        modified = false;
+        if (current_instr_valid) {
+            working_ata = RtiFile::InstrumentToAta(current_instr, instr_stereo);
+            engine.LoadInstrumentSlot(kInstrSlot, working_ata.data(), working_ata.size());
+        }
+        editor.Clamp(current_instr);
+        SetNotice("Reverted to saved");
+    }
     void EditHex(int nibble)   { DoEdit([&]{ return editor.InputHex(nibble, current_instr); }); }
     void EditNudge(int delta)  { DoEdit([&]{ return editor.Increment(delta, current_instr); }); }
     void EditChar(char c)      { DoEdit([&]{ return editor.InsertChar(c, current_instr); }); }
@@ -712,7 +1059,7 @@ struct App {
         // Sound-identical instruments are deduplicated by ATA blob (names and
         // source paths are ignored). If the same sound is already in a slot,
         // move the highlight to that slot instead of creating a duplicate.
-        std::vector<byte> ata = RtiFile::InstrumentToAta(current_instr, /*stereo=*/false);
+        std::vector<byte> ata = RtiFile::InstrumentToAta(current_instr, instr_stereo);
         int existing = bank.IndexOfAta(ata);
         if (existing >= 0) {
             bank_cursor = existing;
@@ -774,6 +1121,22 @@ struct App {
         bank_cursor = (bank_cursor + delta + Bank::SLOT_COUNT) % Bank::SLOT_COUNT;
     }
 
+    // Move the bank cursor AND - when the new slot is occupied - load that
+    // instrument into the editor panels (same effect as left-clicking a
+    // filled slot). Empty slots just move the cursor without touching
+    // what's currently loaded, so the user can walk over gaps without
+    // losing their in-flight edit. Bound to Ctrl+Left/Right/Up/Down so
+    // arrow stepping doubles as a "navigate + audition" gesture; the
+    // Ctrl+letter audition path still plays without loading.
+    void MoveBankCursorAndLoad(int delta)
+    {
+        MoveBankCursor(delta);
+        if (bank_cursor < 0 || bank_cursor >= Bank::SLOT_COUNT) return;
+        if (!bank.At(bank_cursor).used) return;
+        int slot = bank_cursor;
+        GuardedNav([this, slot]() { LoadBankSlot(slot); });
+    }
+
     void RemoveBankCursorSlot()
     {
         if (bank_cursor < 0 || bank_cursor >= Bank::SLOT_COUNT) return;
@@ -817,16 +1180,55 @@ struct App {
 
     // ---------- Bank-slot context-menu actions ----------
 
+    // Close every right-click popup (bank menu, tree menu, category picker).
+    // The Open* helpers below call this first so only one popup is ever on
+    // screen at a time. ESC also routes through here when a popup is open.
+    void CloseAllPopups()
+    {
+        bank_menu_open   = false;
+        bank_menu_cluster_info.clear();
+        tree_menu_open   = false;
+        cat_picker_open  = false;
+    }
+    bool AnyPopupOpen() const
+    {
+        return bank_menu_open || tree_menu_open || cat_picker_open;
+    }
+
     void OpenBankSlotMenu(int slot, int x, int y)
     {
         if (slot < 0 || slot >= Bank::SLOT_COUNT) return;
+        CloseAllPopups();
         bank_menu_open = true;
         bank_menu_slot = slot;
         bank_menu_x    = x;
         bank_menu_y    = y;
+        bank_menu_cluster_info = CachedBankClusterInfo(slot);
     }
 
-    void CloseBankSlotMenu() { bank_menu_open = false; }
+    void CloseBankSlotMenu()
+    {
+        bank_menu_open = false;
+        bank_menu_cluster_info.clear();
+    }
+
+    // Look up the cluster info to display for a slot. Returns the cached
+    // string when the slot is still occupied AND the cached hash matches
+    // the slot's current ATA (so an Import/Paste/edit since the last
+    // Analyse correctly returns nothing). Empty string is what the menu
+    // renders as "None".
+    std::string CachedBankClusterInfo(int slot) const
+    {
+        if (slot < 0 || slot >= Bank::SLOT_COUNT) return std::string{};
+        const Bank::Slot& s = bank.At(slot);
+        if (!s.used) return std::string{};
+        if (s.cluster_info.empty()) return std::string{};
+        // Hash mismatch = slot was mutated since the cluster info was
+        // computed (Import/Paste/editor save changed the ATA). Treat as
+        // stale so the menu shows "None" and prompts a re-Analyse.
+        if (Analysis::HashAta(s.ata) != s.cluster_hash) return std::string{};
+        return s.cluster_info;
+    }
 
     // Open the directory-tree right-click menu anchored at (x,y) for the
     // given file node.
@@ -834,6 +1236,7 @@ struct App {
     {
         if (node < 0 || node >= dir.NodeCount()) return;
         if (dir.At(node).type != Directory::NodeType::File) return;
+        CloseAllPopups();
         tree_menu_open = true;
         tree_menu_node = node;
         tree_menu_x    = x;
@@ -845,12 +1248,145 @@ struct App {
     void OpenCategoryPicker(int node, int x, int y)
     {
         if (node < 0 || node >= dir.NodeCount()) return;
+        CloseAllPopups();
         cat_picker_open = true;
         cat_picker_node = node;
         cat_picker_x    = x;
         cat_picker_y    = y;
     }
     void CloseCategoryPicker() { cat_picker_open = false; }
+
+    // Render the bank slot's instrument through the engine and assign it
+    // to the nearest existing library cluster. Returns a multi-line string
+    // suitable for the bank menu's bottom info area:
+    //   "Cluster 5 - Bass + Pad (dark, sustained)"
+    //   "Members: 24"
+    // On any failure (no engine, no patched DLL, no clustered library, no
+    // valid audio render) returns a one-line explanatory message.
+    std::string FindClusterForBankSlot(int slot)
+    {
+        if (slot < 0 || slot >= Bank::SLOT_COUNT) return "Invalid slot";
+        const Bank::Slot& s = bank.At(slot);
+        if (!s.used)                   return "Empty slot";
+        if (!Pokey::HasAnalysisAbi())  return "sa_pokey.dll: no analysis ABI";
+        const int ncl = dir.ClusterCount();
+        if (ncl <= 0)                  return "No clusters - run F7 first";
+
+        // Pause SDL audio so the tap doesn't race against the audio thread,
+        // render the slot's instrument, restore audio.
+        audio.Pause();
+        Analysis::Features feats = Analysis::ExtractFeaturesOneShot(engine, s.ata);
+        audio.Resume();
+        if (!feats.valid)              return "Audio render failed";
+
+        // Build per-cluster centroids from the library's clustered files.
+        // Centroid distance is computed in the same normalised feature
+        // space used by Analysis::FillVec (Hz axes divided by 22050) so
+        // it lines up with how Analysis::Run did the original clustering.
+        std::vector<std::array<float, 8>> centroids(ncl, std::array<float, 8>{});
+        std::vector<int> counts(ncl, 0);
+        for (int node : dir.AllFiles()) {
+            const auto& n = dir.At(node);
+            if (!n.audio_valid || n.cluster_id < 0 || n.cluster_id >= ncl) continue;
+            centroids[n.cluster_id][0] += n.audio[0];
+            centroids[n.cluster_id][1] += n.audio[1];
+            centroids[n.cluster_id][2] += n.audio[2];
+            centroids[n.cluster_id][3] += n.audio[3];
+            centroids[n.cluster_id][4] += n.audio[4];
+            centroids[n.cluster_id][5] += n.audio[5] / 22050.0f;
+            centroids[n.cluster_id][6] += n.audio[6] / 22050.0f;
+            centroids[n.cluster_id][7] += n.audio[7];
+            counts[n.cluster_id]++;
+        }
+        int populated = 0;
+        for (int c = 0; c < ncl; ++c) {
+            if (counts[c] == 0) continue;
+            for (int d = 0; d < 8; ++d) centroids[c][d] /= (float)counts[c];
+            ++populated;
+        }
+        if (populated == 0)            return "No clustered library files";
+
+        float q[8] = {
+            feats.rms_early, feats.rms_mid, feats.rms_late,
+            feats.zcr, feats.peak_pos,
+            feats.centroid / 22050.0f, feats.rolloff / 22050.0f,
+            feats.flux,
+        };
+
+        int   best_cl   = -1;
+        float best_dist = 1e30f;
+        for (int c = 0; c < ncl; ++c) {
+            if (counts[c] == 0) continue;
+            float d2 = 0.0f;
+            for (int d = 0; d < 8; ++d) {
+                float diff = q[d] - centroids[c][d];
+                d2 += diff * diff;
+            }
+            if (d2 < best_dist) { best_dist = d2; best_cl = c; }
+        }
+        if (best_cl < 0)               return "No matching cluster found";
+
+        // Reuse the same descriptive-label helper the cluster headers use,
+        // so the bank menu's label format matches what's shown in the tree.
+        std::vector<int> members;
+        members.reserve((size_t)counts[best_cl]);
+        for (int node : dir.AllFiles()) {
+            if (dir.At(node).cluster_id == best_cl) members.push_back(node);
+        }
+        std::string label = dir.ClusterCharacterLabel(members);
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "Cluster %d - %s\nMembers: %d",
+            best_cl + 1, label.empty() ? "(no descriptor)" : label.c_str(),
+            counts[best_cl]);
+        return std::string(buf);
+    }
+
+    // Analyse every used slot in the bank and store the result on each
+    // Bank::Slot (which serialises through manifest.txt). Triggered by the
+    // "Analyse" button on the bank panel. Updates the notice bar with a
+    // progress count while it runs and a final summary when done.
+    void AnalyseAllBankSlots()
+    {
+        if (!Pokey::HasAnalysisAbi()) {
+            SetNotice("Bank Analyse: sa_pokey.dll has no analysis ABI");
+            return;
+        }
+        if (dir.ClusterCount() <= 0) {
+            SetNotice("Bank Analyse: no clusters - run F7 first");
+            return;
+        }
+        int used = bank.UsedCount();
+        if (used == 0) {
+            SetNotice("Bank Analyse: bank is empty");
+            return;
+        }
+
+        int done = 0, failed = 0;
+        for (int slot = 0; slot < Bank::SLOT_COUNT; ++slot) {
+            if (!bank.At(slot).used) continue;
+            std::string info = FindClusterForBankSlot(slot);
+            // FindClusterForBankSlot returns "Cluster N - ..." on success;
+            // anything else (e.g. "Audio render failed") is an error. We
+            // still cache it so the user can see what went wrong on a
+            // per-slot Analyse, but count it toward the failure tally.
+            if (info.rfind("Cluster ", 0) == 0) ++done;
+            else                                 ++failed;
+            bank.SetClusterInfo(slot, info,
+                Analysis::HashAta(bank.At(slot).ata));
+        }
+        char buf[128];
+        if (failed == 0) {
+            std::snprintf(buf, sizeof(buf),
+                "Bank Analyse: %d / %d slots clustered", done, used);
+        } else {
+            std::snprintf(buf, sizeof(buf),
+                "Bank Analyse: %d ok, %d failed (out of %d)",
+                done, failed, used);
+        }
+        SetNotice(buf);
+    }
 
     // Adjust the manual k-means cluster count for the next analysis run.
     // Negative values clamp to 0 (which means "automatic" inside Analysis).
@@ -1003,7 +1539,7 @@ struct App {
     void ExportCurrentRti()
     {
         if (!current_instr_valid) { SetNotice("No instrument to export."); return; }
-        std::vector<byte> ata = RtiFile::InstrumentToAta(current_instr, /*stereo=*/false);
+        std::vector<byte> ata = RtiFile::InstrumentToAta(current_instr, instr_stereo);
         std::string name = TrimName();
 
         static const SDL_DialogFileFilter filters[] = { { "RMT instrument", "rti" } };
@@ -1122,9 +1658,12 @@ struct App {
     // analysis explicitly on the same library.
     void LoadOrRunAnalysis()
     {
-        if (Analysis::LoadAndApply(dir, library_path)) {
+        int loaded_k = -1;
+        if (Analysis::LoadAndApply(dir, library_path, &loaded_k)) {
             dir.SetHideDuplicates(true);
-            std::printf("Loaded analysis.json\n");
+            if (loaded_k >= 0) k_clusters_override = loaded_k;
+            std::printf("Loaded analysis.json (k_override = %d)\n",
+                        k_clusters_override);
             return;
         }
         if (dir.AllFiles().empty()) return;   // empty library, nothing to do
@@ -1136,8 +1675,12 @@ struct App {
         opts.k_override = k_clusters_override;
         opts.progress   = &App::AnalysisProgressThunk;
         opts.progress_ud = this;
+        // Pause SDL audio so Analysis::Run can own the engine + audio tap
+        // without racing against our playback thread. Resume puts both back.
+        audio.Pause();
         Analysis::Summary sum = Analysis::Run(dir, library_path,
                                               /*writeJson=*/true, opts);
+        audio.Resume();
         if (sum.ok) {
             dir.SetHideDuplicates(true);
             PrintAnalysisReport(sum);
@@ -1159,8 +1702,10 @@ struct App {
         opts.k_override = k_clusters_override;
         opts.progress   = &App::AnalysisProgressThunk;
         opts.progress_ud = this;
+        audio.Pause();
         Analysis::Summary sum = Analysis::Run(dir, library_path,
                                               /*writeJson=*/true, opts);
+        audio.Resume();
         if (!sum.ok) { SetNotice("Analysis failed."); return; }
         dir.SetHideDuplicates(true);
         LoadCurrent();   // restores the engine's instrument slot to the live one
@@ -1356,17 +1901,136 @@ char NameChar(SDL_Keycode k, bool shift)
 // audio device, no engine - the analysis pass is parametric-only in
 // this release anyway, so all we need is the .RTI parser and the
 // Directory + Analysis classes.
-int RunHeadlessAnalyse(const std::string& folder)
-{
 #ifdef _WIN32
-    // PokeyForge is built as a Windows-subsystem app, which has no
-    // stdout/stderr by default. When invoked from a console (CMD,
-    // PowerShell) we attach to the parent's console so the analysis
-    // progress messages actually appear instead of vanishing.
+// Re-attach Windows-subsystem app to the parent console so printf/fprintf
+// appear in CMD/PowerShell. No-op when launched without a parent console.
+static void AttachParentConsole()
+{
     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         std::freopen("CONOUT$", "w", stdout);
         std::freopen("CONOUT$", "w", stderr);
     }
+}
+#else
+static void AttachParentConsole() {}
+#endif
+
+// --smoke-tap <out.raw>
+//
+// Drives the patched sa_pokey.dll end-to-end without any GUI/SDL. Mutes
+// the native audio, installs an audio tap, writes a square-wave to POKEY
+// channel 1, runs Pokey_Process for ~500 ms, and dumps the captured float
+// samples to <out.raw>. Used to verify that the audio-tap path produces
+// non-silent samples *before* re-enabling the full audio-feature pipeline
+// in Analysis.cpp. Returns 0 on success.
+struct SmokeTapBuffer {
+    std::vector<float> samples;
+    std::uint32_t      total = 0;
+};
+
+static void __cdecl SmokeTapCallback(const float* left, const float* /*right*/,
+                                     std::uint32_t count, std::uint32_t /*ts*/,
+                                     void* user)
+{
+    auto* buf = static_cast<SmokeTapBuffer*>(user);
+    if (!buf || !left || !count) return;
+    buf->samples.insert(buf->samples.end(), left, left + count);
+    buf->total += count;
+}
+
+static int RunSmokeTap(const std::string& out_path)
+{
+    AttachParentConsole();
+
+    if (!Pokey::InitDll()) {
+        std::fprintf(stderr, "smoke-tap: failed to load sa_pokey.dll\n");
+        return 2;
+    }
+    if (!Pokey::HasAnalysisAbi()) {
+        std::fprintf(stderr,
+            "smoke-tap: sa_pokey.dll has no analysis ABI exports.\n"
+            "  -> The DLL next to PokeyForge.exe is the original RMT build.\n"
+            "  -> Replace it with the patched build from AltirraSDL.\n");
+        Pokey::DeInitDll();
+        return 3;
+    }
+    std::printf("smoke-tap: %s\n", Pokey::About());
+    std::printf("smoke-tap: analysis ABI v%d.%d\n",
+                (Pokey::AnalysisAbiVersion() >> 16) & 0xFFFF,
+                Pokey::AnalysisAbiVersion() & 0xFFFF);
+
+    // 44100 Hz host rate is unused by the tap (tap fires at the engine's
+    // native ~64 kHz), but Pokey_SoundInit needs *some* rate for its
+    // cycles-per-tick math inside Advance().
+    constexpr std::uint32_t kClockNTSC = 1789773;
+    Pokey::SoundInit(kClockNTSC, 44100, 1);
+
+    Pokey::SetMute(true);
+
+    SmokeTapBuffer cap;
+    Pokey::SetAudioTap(&SmokeTapCallback, &cap);
+
+    // Square-wave on channel 1: AUDF1 = 0x40, AUDC1 = volume 8 + distortion
+    // 0xA0 (pure tone with poly bypass), AUDCTL = 0. That's ~280 Hz, plenty
+    // loud, no envelope -> stays on for the full window.
+    Pokey::PutByte(0x00, 0x40);   // AUDF1
+    Pokey::PutByte(0x01, 0xA8);   // AUDC1 = pure + vol 8
+    Pokey::PutByte(0x08, 0x00);   // AUDCTL
+
+    // 500 ms at 44.1 kHz host rate = 22050 host samples. Drive them in
+    // 1024-sample chunks so Advance() loops with realistic granularity.
+    std::vector<std::uint8_t> throwaway(1024);
+    const int total_host = 22050;
+    int produced_host = 0;
+    while (produced_host < total_host) {
+        int want = std::min<int>(1024, total_host - produced_host);
+        Pokey::Process(throwaway.data(), (std::uint16_t)want);
+        produced_host += want;
+    }
+
+    Pokey::SetAudioTap(nullptr, nullptr);
+    Pokey::SetMute(false);
+
+    if (cap.samples.empty()) {
+        std::fprintf(stderr, "smoke-tap: tap never fired (0 samples captured)\n");
+        Pokey::DeInitDll();
+        return 4;
+    }
+
+    // Summary stats so success/failure is visible without inspecting the file.
+    float mn =  1e9f, mx = -1e9f, sum = 0.0f, sqsum = 0.0f;
+    for (float v : cap.samples) {
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        sum += v;
+        sqsum += v * v;
+    }
+    const float mean = sum / (float)cap.samples.size();
+    const float rms  = std::sqrt(sqsum / (float)cap.samples.size());
+    std::printf("smoke-tap: captured %u samples (~%.1f ms @ engine rate)\n",
+                cap.total, 1000.0f * (float)cap.total / 63920.0f);
+    std::printf("smoke-tap: min=%.4f  max=%.4f  mean=%.4f  rms=%.4f\n",
+                mn, mx, mean, rms);
+
+    FILE* fp = std::fopen(out_path.c_str(), "wb");
+    if (!fp) {
+        std::fprintf(stderr, "smoke-tap: cannot open %s for writing\n", out_path.c_str());
+        Pokey::DeInitDll();
+        return 5;
+    }
+    std::fwrite(cap.samples.data(), sizeof(float), cap.samples.size(), fp);
+    std::fclose(fp);
+    std::printf("smoke-tap: wrote %s (%zu bytes, mono float32 @ ~63920 Hz)\n",
+                out_path.c_str(), cap.samples.size() * sizeof(float));
+
+    Pokey::DeInitDll();
+    return (rms > 1e-6f) ? 0 : 6;
+}
+
+int RunHeadlessAnalyse(const std::string& folder)
+{
+#ifdef _WIN32
+    AttachParentConsole();
 #endif
     std::error_code ec;
     if (!fs::is_directory(folder, ec)) {
@@ -1387,8 +2051,41 @@ int RunHeadlessAnalyse(const std::string& folder)
     }
     std::printf("PokeyForge --analyse: %d .RTI files in %s\n",
                 (int)dir.AllFiles().size(), folder.c_str());
-    Analysis::Options opts;   // engine left null -> parametric-only path
+
+    // Bring up a real RmtEngine so Analysis::Run can render audio features
+    // through the patched sa_pokey.dll. Without the engine the analysis
+    // falls back to parametric-only signals, leaving every features.valid
+    // == false in analysis.json.
+    Analysis::Options opts;
+    RmtEngine engine;
+    std::string obx = LocateDriverObx();
+    bool engine_up = false;
+    if (obx.empty()) {
+        std::fprintf(stderr,
+            "PokeyForge --analyse: rmt_driver_v2.obx not found next to the .exe.\n"
+            "  -> falling back to parametric-only analysis (no audio features)\n");
+    } else if (!engine.Init(obx.c_str(), /*ntsc=*/true, kSampleRate)) {
+        std::fprintf(stderr,
+            "PokeyForge --analyse: engine init failed (sa_pokey.dll or driver load).\n"
+            "  -> falling back to parametric-only analysis\n");
+    } else if (!Pokey::HasAnalysisAbi()) {
+        std::fprintf(stderr,
+            "PokeyForge --analyse: sa_pokey.dll has no analysis ABI exports.\n"
+            "  -> falling back to parametric-only analysis. Rebuild sa_pokey.dll\n"
+            "     from the AltirraSDL patch to enable audio features.\n");
+        engine.DeInit();
+    } else {
+        std::printf("PokeyForge --analyse: audio tap available (ABI v%d.%d)\n",
+                    (Pokey::AnalysisAbiVersion() >> 16) & 0xFFFF,
+                    Pokey::AnalysisAbiVersion() & 0xFFFF);
+        opts.engine = &engine;
+        engine_up = true;
+    }
+
     Analysis::Summary sum = Analysis::Run(dir, folder, /*writeJson=*/true, opts);
+
+    if (engine_up) engine.DeInit();
+
     if (!sum.ok) {
         std::fprintf(stderr, "PokeyForge --analyse: analysis failed\n");
         return 5;
@@ -1404,6 +2101,13 @@ int main(int argc, char* argv[])
     // success, non-zero on failure. Bypasses all SDL / GUI startup.
     if (argc >= 3 && std::strcmp(argv[1], "--analyse") == 0) {
         return RunHeadlessAnalyse(argv[2]);
+    }
+
+    // Audio-tap smoke test: PokeyForge.exe --smoke-tap <out.raw>. Used to
+    // verify the patched sa_pokey.dll captures non-silent samples through
+    // the analysis tap. Bypasses SDL/GUI entirely.
+    if (argc >= 3 && std::strcmp(argv[1], "--smoke-tap") == 0) {
+        return RunSmokeTap(argv[2]);
     }
 
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO)) {
@@ -1543,7 +2247,17 @@ int main(int argc, char* argv[])
     }
     app.LoadCurrent();
 
+    // Initialise the TTF text renderer (JetBrains Mono, next to the .exe).
+    TextRenderer text_renderer;
+    {
+        std::string font_path = std::string(SDL_GetBasePath()) + "JetBrainsMono-Regular.ttf";
+        if (!text_renderer.Init(renderer, font_path.c_str(), 13)) {
+            SDL_Log("TTF init failed; falling back to debug font");
+        }
+    }
+
     Gui gui;
+    gui.SetTextRenderer(text_renderer.Ok() ? &text_renderer : nullptr);
     app.gui = &gui;
     bool running = true;
     while (running) {
@@ -1600,6 +2314,14 @@ int main(int argc, char* argv[])
                 SDL_ConvertEventToRenderCoordinates(renderer, &event);
                 int mx = (int)event.wheel.mouse_x;
                 int my = (int)event.wheel.mouse_y;
+                // Help overlay: wheel pages through (up = previous, down =
+                // next, wraps). Checked before any other wheel target so the
+                // help is always navigable regardless of what's underneath.
+                if (app.show_help && gui.PointInHelpPanel(mx, my)) {
+                    app.help_page = (app.help_page + notches + Gui::kHelpPageCount)
+                                    % Gui::kHelpPageCount;
+                    continue;
+                }
                 // Mouse over the "Oct: +N" indicator: wheel changes octave
                 // (one octave per notch, same as the [ / ] keys). Checked
                 // first so the indicator is always responsive, even in
@@ -1608,8 +2330,21 @@ int main(int argc, char* argv[])
                     app.AdjustOctave(-notches * 12);  // wheel up -> +12
                     continue;
                 }
-                if (app.editor.active && !gui.PointInTreePane(mx, my)) {
-                    app.EditNudge(-notches);    // wheel up -> +1, wheel down -> -1
+                // Wheel over the edit area: auto-enter edit mode on the
+                // hovered field (if any) and nudge it.  If no cell is directly
+                // under the cursor but the editor is already active, nudge the
+                // currently focused field.  Wheel in the tree pane always steps
+                // the instrument list regardless of edit-mode state.
+                if (!gui.PointInTreePane(mx, my) && app.current_instr_valid) {
+                    Gui::EditHit h = gui.EditFieldAtLogical(mx, my, app.current_instr);
+                    if (h.hit) {
+                        app.EnterEditField(h.panel, h.a, h.b);
+                        app.EditNudge(-notches);
+                    } else if (app.editor.active) {
+                        app.EditNudge(-notches);
+                    } else {
+                        app.StepFiles(notches * 3);
+                    }
                 } else {
                     app.StepFiles(notches * 3); // 3 files per notch = quick
                 }
@@ -1621,17 +2356,44 @@ int main(int argc, char* argv[])
             // being dragged, also forward the y coordinate to the drag.
             if (event.type == SDL_EVENT_MOUSE_MOTION) {
                 SDL_ConvertEventToRenderCoordinates(renderer, &event);
-                app.mouse_x = (int)event.motion.x;
-                app.mouse_y = (int)event.motion.y;
+                int mmx = (int)event.motion.x;
+                int mmy = (int)event.motion.y;
+                app.mouse_x = mmx;
+                app.mouse_y = mmy;
                 if (gui.TreeScrollDragging()) {
-                    gui.UpdateTreeScrollDrag((int)event.motion.y);
+                    gui.UpdateTreeScrollDrag(mmy);
+                }
+                // Drag-paint: continue painting envelope cells while LMB held.
+                if (app.drag_paint_active &&
+                    (event.motion.state & SDL_BUTTON_LMASK)) {
+                    Gui::EditHit h = gui.EditFieldAtLogical(
+                        mmx, mmy, app.current_instr);
+                    if (h.hit && h.panel == Editor::Panel::Envelope) {
+                        app.ContinueEnvDragPaint(h.a, h.b);
+                    }
+                }
+                // Vol-popup bar-drag: continue setting values while LMB held.
+                if (gui.VolPopupOpen() && app.vol_drag_active &&
+                    (event.motion.state & SDL_BUTTON_LMASK) &&
+                    app.current_instr_valid) {
+                    Gui::VolPopupHit vh = gui.VolPopupCellAt(mmx, mmy, app.current_instr, app.instr_stereo);
+                    if (vh.hit) app.ContinueVolDrag(vh.col, vh.row, vh.value);
+                }
+                // Goto handle drag: update PAR_ENV_GOTO while LMB held.
+                if (gui.VolPopupOpen() && gui.VolGotoDragging() &&
+                    (event.motion.state & SDL_BUTTON_LMASK) &&
+                    app.current_instr_valid) {
+                    app.ContinueGotoDrag(gui.VolGotoColAt(mmx, app.current_instr));
                 }
                 continue;
             }
             if (event.type == SDL_EVENT_MOUSE_BUTTON_UP &&
-                event.button.button == SDL_BUTTON_LEFT &&
-                gui.TreeScrollDragging()) {
-                gui.EndTreeScrollDrag();
+                event.button.button == SDL_BUTTON_LEFT) {
+                if (gui.TreeScrollDragging()) gui.EndTreeScrollDrag();
+                app.EndEnvDragPaint();
+                app.EndVolDrag();
+                app.EndGotoDrag();
+                gui.EndVolGotoDrag();
                 continue;
             }
 
@@ -1681,23 +2443,44 @@ int main(int argc, char* argv[])
                 // menu item also triggers its action. The menu is closed
                 // before invoking the action because some actions open a
                 // confirm dialog which must not stack with the menu.
+                // Exception: "Show cluster" computes a cluster fingerprint
+                // and pins it to the menu's bottom, keeping the menu open
+                // so the user can read it.
                 if (app.bank_menu_open) {
                     int mx = (int)event.button.x;
                     int my = (int)event.button.y;
                     Gui::BankMenuItem mi = Gui::BankMenuItem::None;
-                    if (gui.PointInBankMenu(mx, my, app.bank_menu_x, app.bank_menu_y)) {
+                    if (gui.PointInBankMenu(mx, my, app.bank_menu_x, app.bank_menu_y,
+                                            app.bank_menu_cluster_info)) {
                         mi = gui.BankMenuItemAtLogical(
-                            mx, my, app.bank_menu_x, app.bank_menu_y);
+                            mx, my, app.bank_menu_x, app.bank_menu_y,
+                            app.bank_menu_cluster_info);
                     }
                     int slot = app.bank_menu_slot;
                     bool slot_used = (slot >= 0 && slot < Bank::SLOT_COUNT &&
                                       app.bank.At(slot).used);
+                    if (mi == Gui::BankMenuItem::Analyse) {
+                        if (slot_used) {
+                            std::string info = app.FindClusterForBankSlot(slot);
+                            // Cache on the slot itself so manifest.txt
+                            // persists the result with the bank. Hash is
+                            // the current ATA so an Import/Paste/editor
+                            // save (which all replace .ata) auto-stales
+                            // the cache without us tracking every site.
+                            app.bank.SetClusterInfo(slot, info,
+                                Analysis::HashAta(app.bank.At(slot).ata));
+                            app.bank_menu_cluster_info = info;
+                        }
+                        // Menu stays open so the user can read the result.
+                        continue;
+                    }
                     app.CloseBankSlotMenu();
                     switch (mi) {
                         case Gui::BankMenuItem::New:    app.NewSlot(slot); break;
                         case Gui::BankMenuItem::Clear:  if (slot_used) app.ClearSlot(slot);  break;
                         case Gui::BankMenuItem::Export: if (slot_used) app.ExportSlot(slot); break;
                         case Gui::BankMenuItem::Import: app.ImportSlot(slot); break;
+                        case Gui::BankMenuItem::Analyse: break;  // handled above
                         case Gui::BankMenuItem::None:   break; // click outside = dismiss
                     }
                     continue;
@@ -1775,6 +2558,39 @@ int main(int argc, char* argv[])
                     continue;
                 }
 
+                // Volume popup: if open, either start a bar-drag inside it or
+                // close it on click-outside.  This check runs before all other
+                // instrument-area handlers so the popup is always modal.
+                if (gui.VolPopupOpen()) {
+                    int mx = (int)event.button.x;
+                    int my = (int)event.button.y;
+                    if (!gui.PointInVolPopup(mx, my)) {
+                        gui.CloseVolPopup();
+                        app.EndVolDrag();
+                        app.EndGotoDrag();
+                        gui.EndVolGotoDrag();
+                    } else if (app.current_instr_valid) {
+                        // Mono/Stereo toggle button (top-right of popup).
+                        if (gui.PointInVolPopupStereoToggle(mx, my)) {
+                            app.ToggleStereo();
+                        // Check goto handle strip first (non-overlapping with bars).
+                        } else if (gui.PointInVolGotoHandle(mx, my, app.current_instr)) {
+                            gui.BeginVolGotoDrag();
+                            app.BeginGotoDrag(gui.VolGotoColAt(mx, app.current_instr));
+                        } else {
+                            // Check copy buttons (stereo only).
+                            char cbtn = gui.VolCopyButtonAt(mx, my);
+                            if      (cbtn == 'L') app.CopyVolLToVolR();
+                            else if (cbtn == 'R') app.CopyVolRToVolL();
+                            else {
+                                Gui::VolPopupHit vh = gui.VolPopupCellAt(mx, my, app.current_instr, app.instr_stereo);
+                                if (vh.hit) app.BeginVolDrag(vh.col, vh.row, vh.value);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 // Menu bar (top) takes priority.
                 Gui::MenuAction ma = gui.MenuAtLogical((int)event.button.x,
                                                        (int)event.button.y);
@@ -1820,8 +2636,16 @@ int main(int argc, char* argv[])
                 if (gui.PointInBankEdit((int)event.button.x, (int)event.button.y)) {
                     app.bank_edit = !app.bank_edit;
                     app.SetNotice(app.bank_edit
-                                  ? "Bank EDIT on: Ctrl+C/X/V move instruments"
+                                  ? "Bank EDIT on: Ctrl+C/X/V/Y/S edit, Ctrl+key still moves cursor"
                                   : "Bank EDIT off: Ctrl+key plays the slot");
+                    continue;
+                }
+
+                // Click the bank "Analyse" button (left of EDIT). Fingerprints
+                // every used slot against the library's cluster centroids
+                // and stores the result on each Bank::Slot.
+                if (gui.PointInBankAnalyse((int)event.button.x, (int)event.button.y)) {
+                    app.AnalyseAllBankSlots();
                     continue;
                 }
 
@@ -1837,13 +2661,17 @@ int main(int argc, char* argv[])
                 if (sb == 'a') { gui.PageTreeScroll(-1); continue; }
                 if (sb == 'b') { gui.PageTreeScroll(+1); continue; }
 
-                // Click a tree row: header collapses its category, folder
+                // Click a tree row: header collapses its category or cluster
+                // (depending on which grouped view is active), folder
                 // expands/collapses, file selects + loads it.
                 int trow = gui.TreeRowAtLogical((int)event.button.x, (int)event.button.y);
                 if (trow >= 0 && trow < (int)app.dir.Rows().size()) {
                     const auto& row = app.dir.Rows()[trow];
                     if (row.is_header) {
-                        app.dir.ToggleCategoryCollapsed(row.header_cat);
+                        if (app.dir.GetViewMode() == Directory::ViewMode::Cluster)
+                            app.dir.ToggleClusterCollapsed(row.header_cat);
+                        else
+                            app.dir.ToggleCategoryCollapsed(row.header_cat);
                     } else if (app.dir.At(row.node).type == Directory::NodeType::Folder) {
                         app.dir.ToggleExpanded(row.node);
                     } else {
@@ -1863,10 +2691,39 @@ int main(int argc, char* argv[])
                         app.GuardedNav([&app, slot]() { app.LoadBankSlot(slot); });
                     }
                 } else {
-                    // Click on an instrument field -> edit it.
-                    Gui::EditHit h = gui.EditFieldAtLogical(
-                        (int)event.button.x, (int)event.button.y, app.current_instr);
-                    if (h.hit) app.EnterEditField(h.panel, h.a, h.b);
+                    // Check instrument header buttons (Undo / Redo / Revert)
+                    // before the general field hit-test.
+                    char hbtn = gui.InstrHeaderButtonAt(
+                        (int)event.button.x, (int)event.button.y);
+                    if (hbtn == 'u') { app.Undo(); }
+                    else if (hbtn == 'r') { app.Redo(); }
+                    else if (hbtn == 'v') { app.RevertFromDisk(); }
+                    else if (gui.PointInStereoToggle((int)event.button.x, (int)event.button.y)) {
+                        // Click the mono/stereo toggle button (checked before vol graph
+                        // because the two hit-areas share the same Y band).
+                        app.ToggleStereo();
+                    } else if (app.current_instr_valid &&
+                             gui.PointInVolGraph((int)event.button.x, (int)event.button.y)) {
+                        // Click the mini vol graph strip → open popup editor.
+                        gui.OpenVolPopup();
+                    } else {
+                        // Click on an instrument field -> edit it.
+                        // Envelope cells: begin drag-paint (binary rows toggle first).
+                        // Other binary fields (AUDCTL flags, Tbl Type/Mode): toggle
+                        //   immediately on left-click.
+                        // Small-range params (maxv 2-3, e.g. Vibrato): cycle on click.
+                        Gui::EditHit h = gui.EditFieldAtLogical(
+                            (int)event.button.x, (int)event.button.y, app.current_instr);
+                        if (h.hit) {
+                            if (h.panel == Editor::Panel::Envelope) {
+                                app.BeginEnvDragPaint(h.a, h.b);
+                            } else {
+                                app.EnterEditField(h.panel, h.a, h.b);
+                                app.CycleField();   // no-op if maxv < 2 or > 3
+                                app.ToggleField();  // no-op if not binary (maxv != 1)
+                            }
+                        }
+                    }
                 }
                 continue;
             }
@@ -1897,6 +2754,17 @@ int main(int argc, char* argv[])
 
             // --- About popup: any key closes it ---
             if (app.show_about) { app.show_about = false; continue; }
+
+            // --- Volume popup: ESC closes it ---
+            if (gui.VolPopupOpen()) {
+                if (k == SDLK_ESCAPE) {
+                    gui.CloseVolPopup();
+                    app.EndVolDrag();
+                    app.EndGotoDrag();
+                    gui.EndVolGotoDrag();
+                }
+                continue;
+            }
 
             // --- Search bar capture ---
             if (app.search_active) {
@@ -1939,6 +2807,16 @@ int main(int argc, char* argv[])
                 }
                 continue;
             }
+
+            // ESC over an open right-click popup closes the popup instead of
+            // falling through to "Silence playback / close help". Handled
+            // before the editor and the global ESC default so a popup always
+            // wins. CloseAllPopups() is harmless when multiple are open at
+            // once (we generally enforce one-at-a-time on Open).
+            if (k == SDLK_ESCAPE && app.AnyPopupOpen()) {
+                app.CloseAllPopups();
+                continue;
+            }
             if (k == SDLK_F11) { app.ToggleFullscreen(window); continue; }
             if (k == SDLK_F6)  {
                 app.editor.Toggle();
@@ -1974,19 +2852,22 @@ int main(int argc, char* argv[])
                 // instrument with Ctrl+a..z/0..9.
                 if (ctrl) {
                     if (k == SDLK_Z) { app.Undo(); continue; }
-                    if (k == SDLK_Y) { app.Redo(); continue; }
-                    if (k == SDLK_S) { app.ExportCurrentRti(); continue; }
-                    // C/X/V move slots only in bank EDIT mode; otherwise they
-                    // fall through and play (audition) like other Ctrl+keys.
+                    // C / X / V / Y / S are bank-edit verbs only. Outside
+                    // bank EDIT mode they fall through to the audition path
+                    // (Ctrl+letter plays the keyboard note), so the user
+                    // can't accidentally save / redo / cut a slot by
+                    // pressing letters that are also chromatic note keys.
                     if (app.bank_edit) {
                         if (k == SDLK_C) { app.CopySlot(); continue; }
                         if (k == SDLK_X) { app.CutSlot(); continue; }
                         if (k == SDLK_V) { app.PasteSlot(); continue; }
+                        if (k == SDLK_Y) { app.Redo(); continue; }
+                        if (k == SDLK_S) { app.ExportCurrentRti(); continue; }
                     }
-                    if (k == SDLK_LEFT)  { app.MoveBankCursor(-1); continue; }
-                    if (k == SDLK_RIGHT) { app.MoveBankCursor(+1); continue; }
-                    if (k == SDLK_UP)    { app.MoveBankCursor(-8); continue; }
-                    if (k == SDLK_DOWN)  { app.MoveBankCursor(+8); continue; }
+                    if (k == SDLK_LEFT)  { app.MoveBankCursorAndLoad(-1); continue; }
+                    if (k == SDLK_RIGHT) { app.MoveBankCursorAndLoad(+1); continue; }
+                    if (k == SDLK_UP)    { app.MoveBankCursorAndLoad(-8); continue; }
+                    if (k == SDLK_DOWN)  { app.MoveBankCursorAndLoad(+8); continue; }
                     if (k == SDLK_DELETE) { app.RequestRemoveCursor(); continue; }
                     if (k == SDLK_INSERT) { app.RequestInsertIntoCursor(); continue; }
                     int off = Keyboard::NoteOffset(k);
@@ -2033,19 +2914,21 @@ int main(int argc, char* argv[])
             // Ctrl bank verbs operate on the selected bank slot.
             if (SDL_GetModState() & SDL_KMOD_CTRL) {
                 if (k == SDLK_Z) { app.Undo(); continue; }
-                if (k == SDLK_Y) { app.Redo(); continue; }
-                if (k == SDLK_S) { app.ExportCurrentRti(); continue; }
-                // C/X/V move slots only in bank EDIT mode; otherwise they
-                // fall through and play the selected slot.
+                // C / X / V / Y / S are bank-edit verbs only. Outside bank
+                // EDIT mode they fall through and play the selected slot,
+                // so Ctrl+S can't accidentally export when the user meant
+                // to audition the 'S' note.
                 if (app.bank_edit) {
                     if (k == SDLK_C) { app.CopySlot(); continue; }
                     if (k == SDLK_X) { app.CutSlot(); continue; }
                     if (k == SDLK_V) { app.PasteSlot(); continue; }
+                    if (k == SDLK_Y) { app.Redo(); continue; }
+                    if (k == SDLK_S) { app.ExportCurrentRti(); continue; }
                 }
-                if (k == SDLK_LEFT)  { app.MoveBankCursor(-1); continue; }
-                if (k == SDLK_RIGHT) { app.MoveBankCursor(+1); continue; }
-                if (k == SDLK_UP)    { app.MoveBankCursor(-8); continue; }
-                if (k == SDLK_DOWN)  { app.MoveBankCursor(+8); continue; }
+                if (k == SDLK_LEFT)  { app.MoveBankCursorAndLoad(-1); continue; }
+                if (k == SDLK_RIGHT) { app.MoveBankCursorAndLoad(+1); continue; }
+                if (k == SDLK_UP)    { app.MoveBankCursorAndLoad(-8); continue; }
+                if (k == SDLK_DOWN)  { app.MoveBankCursorAndLoad(+8); continue; }
                 if (k == SDLK_DELETE) { app.RequestRemoveCursor(); continue; }
                 if (k == SDLK_INSERT) { app.RequestInsertIntoCursor(); continue; }
                 int off = Keyboard::NoteOffset(k);
@@ -2075,7 +2958,7 @@ int main(int argc, char* argv[])
                     break;
 
                 case SDLK_LEFTBRACKET:
-                    app.octave_shift = std::max(-12, app.octave_shift - 12);
+                    app.octave_shift = std::max(-24, app.octave_shift - 12);
                     std::printf("Octave shift = %+d semitones\n", app.octave_shift); break;
                 case SDLK_RIGHTBRACKET:
                     app.octave_shift = std::min(+24, app.octave_shift + 12);
@@ -2126,6 +3009,7 @@ int main(int argc, char* argv[])
         gs.bank_menu_slot   = app.bank_menu_slot;
         gs.bank_menu_x      = app.bank_menu_x;
         gs.bank_menu_y      = app.bank_menu_y;
+        gs.bank_menu_cluster_info = app.bank_menu_cluster_info;
         gs.tree_menu_open   = app.tree_menu_open;
         gs.tree_menu_node   = app.tree_menu_node;
         gs.tree_menu_x      = app.tree_menu_x;
@@ -2138,6 +3022,9 @@ int main(int argc, char* argv[])
         gs.cat_picker_y     = app.cat_picker_y;
         gs.mouse_x          = app.mouse_x;
         gs.mouse_y          = app.mouse_y;
+        gs.instr_stereo     = app.instr_stereo;
+        gs.undo_depth       = (int)app.undo_stack.size();
+        gs.redo_depth       = (int)app.redo_stack.size();
         app.engine.SnapshotPokey(gs.pokey);
         gs.current_bank_slot = (app.current_source == App::Source::Bank)
                                    ? app.current_bank_slot : -1;
@@ -2151,6 +3038,7 @@ int main(int argc, char* argv[])
     app.SaveConfig();
     app.audio.Close();
     app.engine.DeInit();
+    text_renderer.Quit();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();

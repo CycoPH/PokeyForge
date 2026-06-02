@@ -32,6 +32,12 @@ public:
     void Move(int dx, int dy, const TInstrument& ins);
 
     // Returns true if the instrument changed (caller must re-encode).
+    // Input is range-validated: digits out of the field's range are silently
+    // rejected (e.g. '5' into a 0-3 field does nothing).
+    // Fields with maxv <= 15 accept a single nibble then auto-advance the
+    // cursor.  Fields with maxv <= 255 use a two-nibble hex-editor style:
+    // the first digit sets the high nibble and the second the low nibble,
+    // after which the cursor advances to the next cell.
     bool InputHex(int nibble, TInstrument& ins);
     bool Increment(int delta, TInstrument& ins);
 
@@ -57,6 +63,9 @@ public:
         int  value = -1;          // current value (-1 = not numeric, e.g. Name)
         int  vmin = 0, vmax = 0;  // valid range
         const char* help = "";    // what the field does
+        // For small-range params: nullptr-terminated list of option labels.
+        // Null means no option pills; use raw hex.
+        const char* const* options = nullptr;
     };
     FieldInfo Describe(const TInstrument& ins) const;
 
@@ -70,6 +79,8 @@ public:
     void Clamp(const TInstrument& ins);
 
 private:
-    bool m_typing_fresh = true; // next hex digit replaces rather than shifts
+    // For two-nibble fields: true = next key starts a fresh entry (high nibble).
+    // false = next key completes the entry (low nibble).
+    bool m_typing_fresh = true;
     void ResetTyping() { m_typing_fresh = true; }
 };

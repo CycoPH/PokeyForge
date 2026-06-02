@@ -1,6 +1,7 @@
 #include "Analysis.h"
 
 #include "Directory.h"
+#include "Pokey.h"
 #include "RmtEngine.h"
 #include "RtiFile.h"
 
@@ -11,6 +12,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -250,14 +252,21 @@ Category CategoryFromFilename(const std::string& fname)
 
 // ----- Audio rendering + feature extraction ------------------------------
 
-constexpr int kRenderSampleRate = 44100;
-constexpr int kRenderSamples    = 8192;    // ~186 ms at 44.1 kHz
-constexpr int kFftSize          = 1024;    // small radix-2 FFT
-constexpr int kFftFrames        = 3;       // start / mid / end snapshots
-constexpr int kRenderTrack      = 0;
-constexpr int kRenderSlot       = 0;
-constexpr int kRenderNote       = 24;      // mid-range chromatic note
-constexpr int kRenderVolume     = 15;
+// Host-side render budget: ~186 ms of "host time" worth of Pokey_Process
+// calls. The audio tap fires at POKEY's native mix rate (kATCyclesPerSyncSample
+// == 28 cycles per sample, so ~63.9 kHz NTSC / ~63.3 kHz PAL) and the
+// emulator runs as fast as the host CPU - in practice we get well over
+// the kFftSize * 3 samples we need for analysis.
+constexpr int kRenderHostSamples = 8192;
+constexpr int kFftSize           = 1024;  // small radix-2 FFT
+constexpr int kRenderTrack       = 0;
+constexpr int kRenderSlot        = 0;
+constexpr int kRenderNote        = 24;    // mid-range chromatic note
+constexpr int kRenderVolume      = 15;
+
+// Engine mix rates. Match audiooutput.cpp's `mMixingRate = cps / 28.0`.
+constexpr float kEngineMixRateNTSC = 1789772.5f / 28.0f;
+constexpr float kEngineMixRatePAL  = 1773447.0f / 28.0f;
 
 // In-place iterative radix-2 FFT. N must be a power of 2. Phase convention
 // matches numpy.fft.fft (negative exponent). Cheap and self-contained so
@@ -300,14 +309,15 @@ void FFT(float* re, float* im, int N)
     }
 }
 
-// Compute the FFT magnitude spectrum of a window of 8-bit unsigned PCM
-// starting at `samples + offset`. POKEY output is centred at 0x80; we
-// subtract that to make it bipolar before transforming.
-void MagnitudeAt(const byte* samples, int total, int offset,
-                 std::vector<float>& mag_out)
+// Compute the FFT magnitude spectrum of a kFftSize window of float PCM
+// starting at `samples + offset`. POKEY's audio tap delivers samples
+// already in roughly [-1, +1] (the engine's float mix-rate output), so
+// no DC offset removal is needed.
+void MagnitudeAtF(const float* samples, int total, int offset,
+                  std::vector<float>& mag_out)
 {
     mag_out.assign(kFftSize / 2, 0.0f);
-    if (offset + kFftSize > total) return;
+    if (offset < 0 || offset + kFftSize > total) return;
     static thread_local std::vector<float> re, im;
     re.assign(kFftSize, 0.0f);
     im.assign(kFftSize, 0.0f);
@@ -315,8 +325,8 @@ void MagnitudeAt(const byte* samples, int total, int offset,
     // by edge discontinuities.
     constexpr float kPi = 3.14159265358979323846f;
     for (int i = 0; i < kFftSize; ++i) {
-        float s = ((float)samples[offset + i] - 128.0f) / 128.0f;
-        float w = 0.5f - 0.5f * std::cos(2.0f * kPi * i / (kFftSize - 1));
+        float s = samples[offset + i];
+        float w = 0.5f - 0.5f * std::cos(2.0f * kPi * (float)i / (float)(kFftSize - 1));
         re[i] = s * w;
     }
     FFT(re.data(), im.data(), kFftSize);
@@ -325,18 +335,18 @@ void MagnitudeAt(const byte* samples, int total, int offset,
     }
 }
 
-float SpectralCentroid(const std::vector<float>& mag)
+float SpectralCentroid(const std::vector<float>& mag, float sampleRate)
 {
     double num = 0, den = 0;
     for (size_t i = 0; i < mag.size(); ++i) {
-        float freq = (float)i * (float)kRenderSampleRate / (float)kFftSize;
+        float freq = (float)i * sampleRate / (float)kFftSize;
         num += freq * mag[i];
         den += mag[i];
     }
     return den > 0.0 ? (float)(num / den) : 0.0f;
 }
 
-float SpectralRolloff(const std::vector<float>& mag, float pct = 0.85f)
+float SpectralRolloff(const std::vector<float>& mag, float sampleRate, float pct = 0.85f)
 {
     double total = 0;
     for (float m : mag) total += (double)m * m;
@@ -346,10 +356,10 @@ float SpectralRolloff(const std::vector<float>& mag, float pct = 0.85f)
     for (size_t i = 0; i < mag.size(); ++i) {
         cumulative += (double)mag[i] * mag[i];
         if (cumulative >= threshold) {
-            return (float)i * (float)kRenderSampleRate / (float)kFftSize;
+            return (float)i * sampleRate / (float)kFftSize;
         }
     }
-    return (float)kRenderSampleRate / 2.0f;
+    return sampleRate / 2.0f;
 }
 
 // L1 distance between two magnitude spectra, normalised by total energy.
@@ -380,23 +390,118 @@ void WarmupFrames(RmtEngine& engine)
     engine.Generate(sink, 2048);
 }
 
-// (Previously the per-pitch render + feature computation lived here,
-// but audio-feature extraction is disabled in Analysis v6 because POKEY
-// would not render reliably from inside Analysis::Run. The helper bodies
-// above - FFT, MagnitudeAt, SpectralCentroid, SpectralRolloff,
-// FrameDistance, WarmupFrames - are kept for a future re-enable.)
+// Single global capture buffer fed by the audio tap installed during
+// Analysis::Run. Run is single-threaded and not re-entrant, so a static
+// here is fine; the tap callback writes to this buffer (no `user`
+// pointer juggling) and ExtractFeatures consumes it. The tap pointer
+// itself stays installed for the whole pass and clears at the end -
+// see Run() for the lifecycle.
+struct FeatureCapture {
+    std::vector<float> samples;
+};
+FeatureCapture g_capture;
+
+void __cdecl FeatureTapCallback(const float* left, const float* /*right*/,
+                                std::uint32_t count, std::uint32_t /*ts*/,
+                                void* /*user*/)
+{
+    if (!left || !count) return;
+    g_capture.samples.insert(g_capture.samples.end(), left, left + count);
+}
 
 } // anonymous namespace
 
-Features ExtractFeatures(RmtEngine& /*engine*/, const std::vector<byte>& /*ata*/)
+Features ExtractFeaturesOneShot(RmtEngine& engine, const std::vector<byte>& ata)
 {
-    // Audio-feature extraction is disabled (Analysis v6). Every Pokey
-    // render attempted from inside the analysis flow returned 0x80
-    // silence regardless of how we routed it; the classifier falls
-    // back to parametric-only signals. The unused FFT/RMS helpers in
-    // this file are kept in source so a future re-enable doesn't have
-    // to re-derive them.
-    return Features{};
+    if (!Pokey::HasAnalysisAbi()) return Features{};
+    Pokey::SetAudioTap(&FeatureTapCallback, nullptr);
+    Features f = ExtractFeatures(engine, ata);
+    Pokey::SetAudioTap(nullptr, nullptr);
+    g_capture.samples.clear();
+    return f;
+}
+
+Features ExtractFeatures(RmtEngine& engine, const std::vector<byte>& ata)
+{
+    // No tap exports -> the loaded sa_pokey.dll is the original RMT build.
+    // Fall back to parametric-only classification.
+    if (!Pokey::HasAnalysisAbi()) return Features{};
+
+    // Drive the engine: silence anything ringing, load the instrument
+    // into slot 0, warm up so RMT processes its INSTROFF flag, then
+    // trigger note 24 on track 0 at full volume.
+    engine.Silence();
+    engine.LoadInstrumentSlot(kRenderSlot, ata.data(), ata.size());
+    WarmupFrames(engine);
+    engine.NoteOn(kRenderTrack, kRenderNote, kRenderSlot, kRenderVolume);
+
+    // Discard anything the tap captured during Silence + LoadInstrumentSlot
+    // + Warmup + NoteOn. We want only the steady-state note in the analysis
+    // window.
+    g_capture.samples.clear();
+
+    std::vector<byte> sink(kRenderHostSamples);
+    engine.Generate(sink.data(), kRenderHostSamples);
+
+    engine.NoteOff(kRenderTrack);
+
+    if (g_capture.samples.empty()) return Features{};
+
+    const float rate = engine.IsNTSC() ? kEngineMixRateNTSC : kEngineMixRatePAL;
+    const float* s   = g_capture.samples.data();
+    const int total  = (int)g_capture.samples.size();
+
+    Features f;
+    f.valid = true;
+
+    // RMS over thirds of the window. The tap delivers floats already in
+    // roughly [-1, +1] so we don't need to normalise against PCM scale.
+    auto rms_range = [&](int first, int last) {
+        if (last <= first) return 0.0f;
+        double sq = 0;
+        for (int i = first; i < last; ++i) sq += (double)s[i] * (double)s[i];
+        return (float)std::sqrt(sq / (double)(last - first));
+    };
+    const int third = total / 3;
+    f.rms_early = rms_range(0,         third);
+    f.rms_mid   = rms_range(third,     2 * third);
+    f.rms_late  = rms_range(2 * third, total);
+
+    // Zero-crossing rate. Counts sign flips per sample pair, normalised
+    // into [0, 1]. High ZCR = noisy / high-frequency content.
+    int crossings = 0;
+    for (int i = 1; i < total; ++i) {
+        if ((s[i - 1] < 0.0f) != (s[i] < 0.0f)) ++crossings;
+    }
+    f.zcr = total > 1 ? (float)crossings / (float)(total - 1) : 0.0f;
+
+    // Peak position: where in the window the absolute peak sits, 0..1.
+    float peak  = 0.0f;
+    int   peaki = 0;
+    for (int i = 0; i < total; ++i) {
+        float a = std::fabs(s[i]);
+        if (a > peak) { peak = a; peaki = i; }
+    }
+    f.peak_pos = total > 1 ? (float)peaki / (float)(total - 1) : 0.0f;
+
+    // Three FFT snapshots spaced across the window. Use the middle one
+    // for centroid / rolloff (steady-state timbre) and the early/mid +
+    // mid/late distances for flux (timbre motion).
+    if (total >= kFftSize) {
+        std::vector<float> magA, magB, magC;
+        const int offA = 0;
+        const int offB = (total - kFftSize) / 2;
+        const int offC = total - kFftSize;
+        MagnitudeAtF(s, total, offA, magA);
+        MagnitudeAtF(s, total, offB, magB);
+        MagnitudeAtF(s, total, offC, magC);
+
+        f.centroid = SpectralCentroid(magB, rate);
+        f.rolloff  = SpectralRolloff(magB, rate);
+        f.flux     = 0.5f * (FrameDistance(magA, magB) + FrameDistance(magB, magC));
+    }
+
+    return f;
 }
 
 // Heuristic instrument classifier (v3). The decision tree is first-match-
@@ -772,6 +877,24 @@ Summary Run(Directory& dir, const std::string& libraryRoot, bool writeJson,
     RmtEngine* engine = opts.engine;
     Summary sum;
 
+    // Set up the audio tap once for the whole pass. ExtractFeatures (called
+    // per instrument) clears g_capture.samples then drives the engine; the
+    // tap appends mix-rate float samples into g_capture as the engine runs.
+    // SetMute keeps the user from hearing every instrument briefly play
+    // when analysis runs interactively (Audio owns mute state across normal
+    // playback, but headless --analyse has no Audio so we set it here too -
+    // both calls are idempotent). Both are no-ops on the original
+    // (unpatched) sa_pokey.dll - HasAnalysisAbi() guards inside
+    // ExtractFeatures so the pass falls back to parametric-only signals.
+    // Caller is expected to have paused interactive Audio before this point
+    // so the SDL audio thread isn't racing against the engine.Generate()
+    // calls we make per instrument.
+    const bool tap_installed = engine && Pokey::HasAnalysisAbi();
+    if (tap_installed) {
+        Pokey::SetMute(true);
+        Pokey::SetAudioTap(&FeatureTapCallback, nullptr);
+    }
+
     struct Entry {
         int node;
         std::string rel;
@@ -880,6 +1003,17 @@ Summary Run(Directory& dir, const std::string& libraryRoot, bool writeJson,
     }
     dir.RebuildViews();
 
+    // Tear down the tap before any I/O so a late callback can't race
+    // against the buffer / vector clear cycle in g_capture. Leave SetMute
+    // alone - the interactive caller (Audio) owns mute state across normal
+    // playback; the headless --analyse path doesn't care because the
+    // process exits straight after.
+    if (tap_installed) {
+        Pokey::SetAudioTap(nullptr, nullptr);
+        g_capture.samples.clear();
+        g_capture.samples.shrink_to_fit();
+    }
+
     sum.total = (int)entries.size();
     sum.ok = true;
 
@@ -894,6 +1028,11 @@ Summary Run(Directory& dir, const std::string& libraryRoot, bool writeJson,
             // resolves correctly.
             out << "{\n  \"version\": " << kAnalysisVersion << ",\n";
             out << "  \"clusters\": " << k << ",\n";
+            // The user's requested cluster-count override for this library
+            // (0 = automatic). Persisted so PokeyForge restores it on the
+            // next launch without the user having to step Ctrl+] / Ctrl+[
+            // back to their preferred value every time.
+            out << "  \"k_override\": " << opts.k_override << ",\n";
             out << "  \"instruments\": [\n";
             for (size_t i = 0; i < entries.size(); ++i) {
                 const auto& e = entries[i];
@@ -988,8 +1127,10 @@ int ParseVersionFromLine(const std::string& line)
     return got ? v : 0;
 }
 
-bool LoadAndApply(Directory& dir, const std::string& libraryRoot)
+bool LoadAndApply(Directory& dir, const std::string& libraryRoot,
+                  int* out_k_override)
 {
+    if (out_k_override) *out_k_override = -1;
     std::ifstream in(JsonPath(libraryRoot));
     if (!in) return false;
 
@@ -1021,23 +1162,35 @@ bool LoadAndApply(Directory& dir, const std::string& libraryRoot)
         by_rel[RelPath(dir.At(node).path, libraryRoot)] = node;
     }
 
-    // Parse a numeric "clusters": N header (default 0). Same shape as the
-    // version parser, just a different key.
-    int clusters = 0;
-    for (const auto& l : lines) {
-        size_t k = l.find("\"clusters\"");
-        if (k == std::string::npos) continue;
-        size_t colon = l.find(':', k);
-        if (colon == std::string::npos) continue;
-        size_t i = colon + 1;
-        while (i < l.size() && (l[i] == ' ' || l[i] == '\t')) ++i;
-        bool got = false;
-        while (i < l.size() && std::isdigit((unsigned char)l[i])) {
-            clusters = clusters * 10 + (l[i] - '0');
-            ++i;
-            got = true;
+    // Helper to read a bare "key": <int> from any header line. Returns
+    // dflt when the key is missing or its value isn't a non-negative
+    // decimal integer. Used for both "clusters" and "k_override".
+    auto find_int_header = [&](const char* key, int dflt) -> int {
+        std::string needle = std::string("\"") + key + "\"";
+        for (const auto& l : lines) {
+            size_t k = l.find(needle);
+            if (k == std::string::npos) continue;
+            size_t colon = l.find(':', k);
+            if (colon == std::string::npos) continue;
+            size_t i = colon + 1;
+            while (i < l.size() && (l[i] == ' ' || l[i] == '\t')) ++i;
+            int v = 0;
+            bool got = false;
+            while (i < l.size() && std::isdigit((unsigned char)l[i])) {
+                v = v * 10 + (l[i] - '0');
+                ++i;
+                got = true;
+            }
+            if (got) return v;
         }
-        if (got) break;
+        return dflt;
+    };
+    int clusters = find_int_header("clusters", 0);
+    if (out_k_override) {
+        // Caches written before the field existed leave this at -1 so the
+        // caller can fall back to its own default rather than treating a
+        // missing field as "user picked auto".
+        *out_k_override = find_int_header("k_override", -1);
     }
 
     dir.SetCategoryNames(Names());

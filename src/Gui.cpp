@@ -1,5 +1,6 @@
 #include "Gui.h"
 #include "Analysis.h"
+#include "TextRenderer.h"
 #include "Version.h"
 
 #include <algorithm>
@@ -7,6 +8,11 @@
 #include <cstring>
 
 namespace {
+
+	// File-scope TextRenderer pointer set at the start of Gui::Render().
+	// All anonymous-namespace draw helpers route through this so the TTF font
+	// is used when available, with SDL_RenderDebugText as fallback.
+	static TextRenderer* g_tr = nullptr;
 
 	// 1280x720 layout. All measurements in pixels.
 	constexpr int kWinW = 1280;
@@ -18,6 +24,16 @@ namespace {
 	constexpr int kMainX = kTreeW;
 	constexpr int kMainW = kWinW - kTreeW;
 
+	// Instrument panel layout constants (chained so changing one shifts everything below it).
+	// kHeaderH=32 → InstrHdr starts at 34, Parameters at 72, Envelope at 214, NoteTable at 416, Bank at 506.
+	constexpr int kInstrHdrY  = kHeaderH + 2;                           // = 34
+	constexpr int kInstrHdrH  = 36;
+	constexpr int kParamY0    = kInstrHdrY + kInstrHdrH + 2;            // = 72
+	constexpr int kParamRowH  = 18;                                      // fits GlyphH≈16
+	constexpr int kParamH     = 28 + 6 * kParamRowH + 4;                // = 140
+	constexpr int kEnvY0      = kParamY0 + kParamH + 2;                 // = 214
+	constexpr int kNoteTableY0 = kEnvY0 + 200 + 2;                      // = 416
+
 	// Bank panel geometry, shared by the renderer and the mouse hit-test so they
 	// never drift apart.
 	struct BankGeom { int panel_x, panel_y, panel_w, panel_h; int gx, gy, cw, ch, pad; };
@@ -25,17 +41,14 @@ namespace {
 	BankGeom ComputeBankGeom()
 	{
 		int x0 = kMainX + 2;
-		int y0 = kHeaderH + 436;
+		int y0 = kNoteTableY0 + 78 + 2;  // just after the NoteTable panel (max height=78)
 		int w = kMainW - 4;
 		int h = (kWinH - kCmdBarH - 4) - y0;
-		// Cells leave only 4 px of panel margin on each side. The grid origin
-		// pulls in by (4 - cell_pad) so the visible tile (offset by cell_pad
-		// inside its cell) lands exactly 4 px from the panel edge.
-		constexpr int kCellPad = 3;
+		constexpr int kCellPad = 2;          // reduced from 3: inner tile = ch-4 >= GlyphH
 		int gx = x0 + (4 - kCellPad);
-		int gy = y0 + 28;
+		int gy = y0 + 26;                    // grid starts 26px below panel top (underline at y0+24)
 		int cw = (w - 2 * (4 - kCellPad)) / 8;
-		int ch = (h - 36) / 8;
+		int ch = (h - 34) / 8;              // h minus gy-offset(26) minus bottom-margin(8)
 		return BankGeom{ x0, y0, w, h, gx, gy, cw, ch, kCellPad };
 	}
 
@@ -139,8 +152,12 @@ namespace {
 
 	void DrawText(SDL_Renderer* r, Col c, int x, int y, const char* s)
 	{
-		SetCol(r, c);
-		SDL_RenderDebugText(r, (float)x, (float)y, s);
+		if (g_tr && g_tr->Ok()) {
+			g_tr->DrawText(r, SDL_Color{c.r, c.g, c.b, c.a}, x, y, s);
+		} else {
+			SetCol(r, c);
+			SDL_RenderDebugText(r, (float)x, (float)y, s);
+		}
 	}
 
 	// SDL_RenderDebugTextFormat sometimes truncates; build the string ourselves
@@ -153,16 +170,20 @@ namespace {
 		DrawText(r, c, x, y, buf);
 	}
 
+	// Debug font is a fixed 8px per glyph; when TTF is available use its advance.
+	int GlyphW() { return (g_tr && g_tr->Ok()) ? g_tr->CharWidth() : 8; }
+	// Line height for vertical centering: box_y + (box_h - GlyphH()) / 2
+	int GlyphH() { return (g_tr && g_tr->Ok()) ? g_tr->LineHeight() : 8; }
+	constexpr int kGlyphW = 8;  // kept for existing layout math that hasn't switched yet
+
 	// Section title with an underline.
 	void DrawSectionTitle(SDL_Renderer* r, int x, int y, int w, const char* label)
 	{
 		DrawText(r, kHighlight, x, y, label);
 		SetCol(r, kBorder);
-		SDL_RenderLine(r, static_cast<float>(x), static_cast<float>(y + 12), static_cast<float>(x + w), static_cast<float>(y + 12));
+		int lineY = y + GlyphH() + 2;
+		SDL_RenderLine(r, static_cast<float>(x), static_cast<float>(lineY), static_cast<float>(x + w), static_cast<float>(lineY));
 	}
-
-	// Debug font is a fixed 8px per glyph.
-	constexpr int kGlyphW = 8;
 
 	bool EditingPanel(const GuiState& s, Editor::Panel p)
 	{
@@ -311,6 +332,7 @@ void Gui::PageTreeScroll(int direction)
 
 void Gui::Render(SDL_Renderer* r, const GuiState& s)
 {
+	g_tr = m_text_renderer;   // make the TTF renderer available to all helpers
 	FillRect(r, kBg, 0, 0, kWinW, kWinH);
 	DrawHeader(r, s);
 	DrawTree(r, s);
@@ -325,6 +347,7 @@ void Gui::Render(SDL_Renderer* r, const GuiState& s)
 	if (s.bank_menu_open)  DrawBankMenu(r, s);
 	if (s.tree_menu_open)  DrawTreeMenu(r, s);
 	if (s.cat_picker_open) DrawCategoryPicker(r, s);
+	if (m_vol_popup_open)  DrawVolPopup(r, s);
 	if (s.show_help)    DrawHelpOverlay(r, s);
 	if (s.show_prompt)  DrawSavePrompt(r, s);
 	if (s.show_confirm) DrawConfirm(r, s);
@@ -401,15 +424,18 @@ void Gui::DrawConfirm(SDL_Renderer* r, const GuiState& s)
 	// Wrap the message across two lines if long.
 	std::string msg = s.confirm_msg;
 	int max_chars = (kConfirmW - 40) / kGlyphW;
+	const int gh_cd = GlyphH();
+	const int msg_y1 = py + 18 + gh_cd + 10;
+	const int msg_y2 = msg_y1 + gh_cd + 4;
 	if ((int)msg.size() <= max_chars) {
-		DrawText(r, kText, px + 20, py + 46, msg.c_str());
+		DrawText(r, kText, px + 20, msg_y1, msg.c_str());
 	}
 	else {
 		int cut = max_chars;
 		while (cut > 0 && msg[cut] != ' ') --cut;
 		if (cut == 0) cut = max_chars;
-		DrawText(r, kText, px + 20, py + 44, msg.substr(0, cut).c_str());
-		DrawText(r, kText, px + 20, py + 58, msg.substr(cut + 1).c_str());
+		DrawText(r, kText, px + 20, msg_y1, msg.substr(0, cut).c_str());
+		DrawText(r, kText, px + 20, msg_y2, msg.substr(cut + 1).c_str());
 	}
 
 	int by = py + kConfirmH - kConfirmBtnH - 14;
@@ -421,9 +447,9 @@ void Gui::DrawConfirm(SDL_Renderer* r, const GuiState& s)
 		OutlineRect(r, kAccent, bx, by, b.w, kConfirmBtnH);
 		int tw = (int)std::char_traits<char>::length(b.label) * kGlyphW;
 		DrawText(r, hovered ? kBg : kHighlight,
-			bx + (b.w - tw) / 2, by + 9, b.label);
+			bx + (b.w - tw) / 2, by + std::max(0, (kConfirmBtnH - gh_cd) / 2), b.label);
 	}
-	DrawText(r, kTextDim, px + 320, by + 9, "(Enter = Yes, Esc = No)");
+	DrawText(r, kTextDim, px + 320, by + std::max(0, (kConfirmBtnH - gh_cd) / 2), "(Enter = Yes, Esc = No)");
 
 	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
 }
@@ -461,7 +487,7 @@ void Gui::DrawMasterScope(SDL_Renderer* r, const GuiState& s)
 	if (s.last_note_played >= 0) {
 		char nbuf[16];
 		std::snprintf(nbuf, sizeof(nbuf), "#%d", s.last_note_played);
-		DrawText(r, kHighlight, x - 32 + 4, y + 10, nbuf);
+		DrawText(r, kHighlight, x - 32 + 4, y + std::max(0, (h - GlyphH()) / 2), nbuf);
 	}
 
 	int mid = y + h / 2;
@@ -510,7 +536,10 @@ void Gui::DrawEditBar(SDL_Renderer* r, const GuiState& s)
 	if (!s.editor || !s.instrument) return;
 
 	// Docked band spanning the main column, just above the command bar.
-	int h = 56;
+	// Height is derived from the font so all 3 lines always fit.
+	const int gh_eb = GlyphH();
+	const int line_gap = gh_eb + 4;
+	int h = 6 + 3 * line_gap + 6;   // top_pad + 3 lines + bottom_pad
 	int y = kWinH - kCmdBarH - h;
 	int x = kMainX + 4;
 	int w = kWinW - x - 4;
@@ -521,25 +550,73 @@ void Gui::DrawEditBar(SDL_Renderer* r, const GuiState& s)
 	Editor::FieldInfo fi = s.editor->Describe(*s.instrument);
 
 	// Line 1: where the cursor is and the current value.
-	DrawText(r, kHighlight, x + 10, y + 8, "EDITING");
-	char line1[160];
+	DrawText(r, kHighlight, x + 10, y + 6, "EDITING");
+	char line1[200];
 	if (fi.value >= 0) {
-		std::snprintf(line1, sizeof(line1), "%s  >  %s   =   %02X (%d)   range %d-%d",
-			fi.panel, fi.field.c_str(), fi.value & 0xFF, fi.value,
-			fi.vmin, fi.vmax);
+		// Append distortion short name when in the Distortion envelope row.
+		const char* dist_name = "";
+		if (std::string(fi.panel) == "ENVELOPE" &&
+			fi.field.find("Dist") != std::string::npos) {
+			// Short labels indexed by (value >> 1), matching RMT distortion table.
+			static const char* kDistShort[8] = {
+				"WhiteNoise", "Poly5", "Poly4+5", "16-Bit",
+				"Poly17/9" , "Pure" , "BuzzyBass", "GrittyBass"
+			};
+			dist_name = kDistShort[(std::clamp(fi.value & 0xFE, 0, 14)) >> 1];
+		}
+		// Append command short name when in the Command envelope row.
+		const char* cmd_name = "";
+		if (std::string(fi.panel) == "ENVELOPE" &&
+			fi.field.find("Cmd") != std::string::npos) {
+			static const char* kCmdNames[8] = {
+				"Note+XY", "Freq XY", "Note+FreqXY", "Shift Note",
+				"Shift FShift", "Portamento", "Filter/Bass", "AUDCTL"
+			};
+			cmd_name = kCmdNames[std::clamp(fi.value, 0, 7)];
+		}
+		const char* tag = *dist_name ? dist_name : (*cmd_name ? cmd_name : nullptr);
+		if (tag) {
+			std::snprintf(line1, sizeof(line1),
+				"%s  >  %s   =   %02X (%d) \"%s\"   range %d-%d",
+				fi.panel, fi.field.c_str(), fi.value & 0xFF, fi.value,
+				tag, fi.vmin, fi.vmax);
+		} else {
+			std::snprintf(line1, sizeof(line1), "%s  >  %s   =   %02X (%d)   range %d-%d",
+				fi.panel, fi.field.c_str(), fi.value & 0xFF, fi.value,
+				fi.vmin, fi.vmax);
+		}
 	}
 	else {
 		std::snprintf(line1, sizeof(line1), "%s  >  %s", fi.panel, fi.field.c_str());
 	}
-	DrawText(r, kText, x + 90, y + 8, line1);
+	DrawText(r, kText, x + 90, y + 6, line1);
 
-	// Line 2: what the field does.
-	DrawText(r, kTextDim, x + 10, y + 24, fi.help);
+	// Line 2: option pills (small-range params) or help text.
+	if (fi.options && fi.value >= 0) {
+		// Draw labelled pills; active value highlighted.
+		int px = x + 10;
+		const int pill_h = gh_eb + 4;
+		const int line2_y = y + 6 + line_gap;
+		const int line3_y = line2_y + pill_h + 4;
+		for (int i = 0; fi.options[i]; ++i) {
+			bool active = (fi.value == i);
+			int pw = (int)std::strlen(fi.options[i]) * kGlyphW + 10;
+			FillRect(r, active ? kAccent : Col{ 55, 55, 55 }, px, line2_y, pw, pill_h);
+			OutlineRect(r, active ? kHighlight : kBorder, px, line2_y, pw, pill_h);
+			DrawText(r, active ? kBg : kText, px + 5, line2_y + std::max(0, (pill_h - gh_eb) / 2), fi.options[i]);
+			px += pw + 6;
+		}
+		// Help text after pills.
+		DrawText(r, kTextDim, x + 10, line3_y, fi.help);
+	} else {
+		// Line 2: what the field does.
+		DrawText(r, kTextDim, x + 10, y + 6 + line_gap, fi.help);
 
-	// Line 3: the controls.
-	DrawText(r, kFolder, x + 10, y + 40,
-		"Tab panel  arrows move  0-9 A-F set  +/- or Shift+Up/Dn nudge  "
-		"right-click toggle  Ctrl+key play  Space replay  F6 exit");
+		// Line 3: the controls.
+		DrawText(r, kFolder, x + 10, y + 6 + line_gap * 2,
+			"Tab panel  arrows move  0-9 A-F set  +/- or Shift+Up/Dn nudge  "
+			"click toggle  Ctrl+key play  Space replay  F6 exit");
+	}
 }
 
 namespace {
@@ -568,9 +645,12 @@ void Gui::DrawSavePrompt(SDL_Renderer* r, const GuiState& s)
 	OutlineRect(r, kOrange, px, py, kPromptW, kPromptH);
 
 	DrawText(r, kOrange, px + 20, py + 18, "Unsaved instrument edits");
-	DrawText(r, kText, px + 20, py + 46,
+	const int gh_pr = GlyphH();
+	const int pr_y1 = py + 18 + gh_pr + 10;
+	const int pr_y2 = pr_y1 + gh_pr + 4;
+	DrawText(r, kText, px + 20, pr_y1,
 		"You have edited this instrument. Keep the change in the bank");
-	DrawText(r, kText, px + 20, py + 60, "before switching?");
+	DrawText(r, kText, px + 20, pr_y2, "before switching?");
 
 	int by = py + kPromptH - kPromptBtnH - 14;
 	for (const auto& b : kPromptBtns) {
@@ -581,7 +661,7 @@ void Gui::DrawSavePrompt(SDL_Renderer* r, const GuiState& s)
 		OutlineRect(r, kAccent, bx, by, b.w, kPromptBtnH);
 		int tw = (int)std::char_traits<char>::length(b.label) * kGlyphW;
 		DrawText(r, hovered ? kBg : kHighlight,
-			bx + (b.w - tw) / 2, by + 9, b.label);
+			bx + (b.w - tw) / 2, by + std::max(0, (kPromptBtnH - gh_pr) / 2), b.label);
 	}
 
 	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
@@ -611,18 +691,19 @@ void Gui::DrawSearchBar(SDL_Renderer* r, const GuiState& s)
 	FillRect(r, s.search_active ? Col{ 40, 46, 60 } : kPanelDark, x, y, w, h);
 	OutlineRect(r, s.search_active ? kAccent : kBorder, x, y, w, h);
 
-	DrawText(r, kTextDim, x + 6, y + 7, "Find:");
+	const int ty_txt = y + std::max(0, (h - GlyphH()) / 2);
+	DrawText(r, kTextDim, x + 6, ty_txt, "Find:");
 	int tx = x + 6 + 5 * kGlyphW + 4;
 	if (s.search_active || !s.search_query.empty()) {
 		std::string q = Truncate(s.search_query, (x + w - tx - kGlyphW) / kGlyphW);
-		DrawText(r, kText, tx, y + 7, q.c_str());
+		DrawText(r, kText, tx, ty_txt, q.c_str());
 		if (s.search_active) {
 			int caret = tx + (int)q.size() * kGlyphW;
-			FillRect(r, kCellCursor, caret, y + 5, kGlyphW, h - 10);
+			FillRect(r, kCellCursor, caret, y + 3, kGlyphW, h - 6);
 		}
 	}
 	else {
-		DrawText(r, kTextDim, tx, y + 7, "/ to search");
+		DrawText(r, kTextDim, tx, ty_txt, "/ to search");
 	}
 }
 
@@ -653,22 +734,22 @@ void Gui::DrawCommandBar(SDL_Renderer* r, const GuiState& s)
 
 	// A transient notice (e.g. "Saved drums.rmt + 12 .rti") takes priority;
 	// otherwise show the command hints and current library path.
+	const int kCmdTxtY = y + std::max(0, (kCmdBarH - GlyphH()) / 2);
 	if (!s.notice.empty()) {
-		DrawText(r, kHighlight, 8, y + 7, s.notice.c_str());
+		DrawText(r, kHighlight, 8, kCmdTxtY, s.notice.c_str());
 		return;
 	}
 
-	DrawText(r, kTextDim, 8, y + 7, "F2 Save  F3 Load  F4 Lib  F7 Analyse  F8 Group  F9 Dupes");
+	DrawText(r, kTextDim, 8, kCmdTxtY, "F2 Save  F3 Load  F4 Lib  F7 Analyse  F8 Group  F9 Dupes");
 
 	if (!s.library_path.empty()) {
 		std::string lib = "Library: " + s.library_path;
-		int max_chars = (kWinW - 470) / kGlyphW;
+		int max_chars = (kWinW - kWinW/2) / kGlyphW;
 		// Show the tail of long paths (more informative than the head).
 		if ((int)lib.size() > max_chars && max_chars > 4) {
-			lib = "Library: ~" + s.library_path.substr(s.library_path.size() -
-				(size_t)(max_chars - 10));
+			lib = "Library: ~" + s.library_path.substr(s.library_path.size() - (size_t)(max_chars - 10));
 		}
-		DrawText(r, kTextDim, 470, y + 7, lib.c_str());
+		DrawText(r, kTextDim, (kWinW - kWinW / 2), kCmdTxtY, lib.c_str());
 	}
 }
 
@@ -677,21 +758,23 @@ void Gui::DrawHeader(SDL_Renderer* r, const GuiState& s)
 	FillRect(r, kPanel, 0, 0, kWinW, kHeaderH);
 
 	// Clickable menu bar.
+	const int kMenuTxtY = kMenuY + std::max(0, (kMenuH - GlyphH()) / 2);
 	for (const auto& b : kMenu) {
 		FillRect(r, kPanelDark, b.x, kMenuY, b.w, kMenuH);
 		OutlineRect(r, kBorder, b.x, kMenuY, b.w, kMenuH);
-		DrawText(r, kHighlight, b.x + 8, kMenuY + 8, b.label);
+		DrawText(r, kHighlight, b.x + 8, kMenuTxtY, b.label);
 	}
 
 	// Status on the right (kept left of the scope in the top-right corner).
+	const int kHdrTxtY = std::max(0, (kHeaderH - GlyphH()) / 2);
 	int used = s.bank ? s.bank->UsedCount() : 0;
-	DrawTextF(r, kText, 548, 12, "Clock: %s", s.ntsc ? "NTSC 60Hz" : "PAL 50Hz");
-	DrawTextF(r, kText, 690, 12, "Oct: %+d", s.octave_shift);
-	DrawTextF(r, kText, 760, 12, "Bank: %02d/64", used);
+	DrawTextF(r, kText, 548, kHdrTxtY, "Clock: %s", s.ntsc ? "NTSC 60Hz" : "PAL 50Hz");
+	DrawTextF(r, kText, 690, kHdrTxtY, "Oct: %+d", s.octave_shift);
+	DrawTextF(r, kText, 766, kHdrTxtY, "Bank: %02d/64", used);
 
 	bool editing = s.editor && s.editor->active;
-	if (editing)    DrawText(r, kHighlight, 858, 12, "[EDIT]");
-	if (s.modified) DrawText(r, kOrange, 916, 12, "MODIFIED");
+	if (editing)    DrawText(r, kHighlight, 858, kHdrTxtY, "[EDIT]");
+	if (s.modified) DrawText(r, kOrange, 916, kHdrTxtY, "MODIFIED");
 
 	// Master oscilloscope in the top-right corner.
 	DrawMasterScope(r, s);
@@ -724,7 +807,7 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 			OutlineRect(r, kBorder, t.x, ty, t.w, t.h);
 			int label_w = (int)std::strlen(t.label) * kGlyphW;
 			int text_x = t.x + (t.w - label_w) / 2;
-			int text_y = ty + (t.h - 8) / 2;   // 8 px tall debug font
+			int text_y = ty + std::max(0, (t.h - GlyphH()) / 2);
 			DrawText(r, active ? kBg : kTextDim, text_x, text_y, t.label);
 		}
 	}
@@ -736,13 +819,13 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 	const auto& rows = s.dir->Rows();
 	int cur_node = s.dir->CurrentNodeIndex();
 
-	constexpr int kRowH = 16;
+	const int kRowH = std::max(20, GlyphH() + 4);  // tall enough for the font + 2px padding
 	constexpr int kScrollW = 14;     // scrollbar width (flush with right edge)
 	constexpr int kScrollPad = 4;    // gap between rows and scrollbar
 	constexpr int kRowRight = kTreeW - kScrollW - kScrollPad; // text right edge
 	int top = kHeaderH + 26;
 	// Reserve the bottom for the footer line, the search bar and command bar.
-	int bottom = kWinH - kCmdBarH - kSearchH - 16;
+	int bottom = kWinH - kCmdBarH - kSearchH - (GlyphH() + 4);
 	// In Cluster view we steal 72 px from the bottom of the row list to
 	// host the spectral signature panel (drawn below). The panel only
 	// appears in this view because that's where the user is browsing by
@@ -788,9 +871,7 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 	for (int i = scroll; i < end; ++i) {
 		const auto& row = rows[i];
 		int row_y = top + (i - scroll) * kRowH;
-		// Centre the 8 px-tall debug font inside the kRowH-pixel row so the
-		// text doesn't sit on the top edge of the cell.
-		int text_y = row_y + (kRowH - 8) / 2;
+		int text_y = row_y + std::max(0, (kRowH - GlyphH()) / 2);
 		int indent = row.depth * 6 + 8;
 		int avail_chars = (kRowRight - indent) / kGlyphW;
 
@@ -803,14 +884,21 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 		}
 
 		const auto& n = s.dir->At(row.node);
-		if (row.node == cur_node) {
+		// Selection and hover highlights (drawn before text so text is on top).
+		bool is_sel = (row.node == cur_node);
+		bool is_hov = !is_sel &&
+			s.mouse_x >= 4 && s.mouse_x < kRowRight &&
+			s.mouse_y >= row_y && s.mouse_y < row_y + kRowH;
+		if (is_sel) {
 			FillRect(r, kAccent, 4, row_y, kRowRight - 4, kRowH);
+		} else if (is_hov) {
+			FillRect(r, Col{ 40, 44, 56 }, 4, row_y, kRowRight - 4, kRowH);
 		}
 
 		if (n.type == Directory::NodeType::Folder) {
 			const char* glyph = n.expanded ? "v " : "> ";
 			std::string name = Truncate(n.name, std::max(0, avail_chars - 3));
-			DrawTextF(r, kFolder, indent, text_y, "%s%s/", glyph, name.c_str());
+			DrawTextF(r, is_hov ? kText : kFolder, indent, text_y, "%s%s/", glyph, name.c_str());
 		}
 		else {
 			// File rows are tinted by their effective category (manual
@@ -825,7 +913,7 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 				cat_col.g = (Uint8)((cat_col.g + kPanel.g * 2) / 3);
 				cat_col.b = (Uint8)((cat_col.b + kPanel.b * 2) / 3);
 			}
-			Col c = (row.node == cur_node) ? kBg : cat_col;
+			Col c = is_sel ? kBg : (is_hov ? kText : cat_col);
 			char dot = ' ';
 			if (s.bank && s.bank->IndexOfPath(n.path) >= 0) dot = 'B';
 			// Show manual-override marker as 'M' (B takes precedence).
@@ -944,22 +1032,100 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 
 	// Footer: position info + filter state, just above the search bar.
 	if (s.dir->CurrentFileIndex() >= 0) {
-		DrawTextF(r, kTextDim, 8, kWinH - kCmdBarH - kSearchH - 14, "%d / %d shown%s",
+		DrawTextF(r, kTextDim, 8, kWinH - kCmdBarH - kSearchH - GlyphH() - 4, "%d / %d shown%s",
 			s.dir->CurrentFileIndex() + 1, s.dir->NavCount(),
 			s.dir->HideDuplicates() ? "  (dupes hidden)" : "");
+	}
+
+	// Header tooltip: when the cursor is over a category/cluster header
+	// whose label was truncated to fit the tree width, show the full label
+	// in a small word-wrapped box pinned inside the tree pane. Cluster
+	// names with their "Cluster N - Bass + Pad (dark, sustained) (24)"
+	// descriptors are the common case; long category names with overrides
+	// can also trip it. We wrap rather than scaling because SDL3's debug
+	// font is fixed-size - a smaller font would mean bundling SDL_ttf or
+	// a bitmap atlas, which is overkill for one tooltip.
+	if (s.mouse_x >= 0 && s.mouse_x < kTreeW &&
+	    s.mouse_y >= top && s.mouse_y < bottom) {
+		int rel = (s.mouse_y - top) / kRowH;
+		int idx = scroll + rel;
+		if (idx >= 0 && idx < total) {
+			const auto& hrow = rows[idx];
+			int avail = std::max(0, (kRowRight - 22) / kGlyphW);
+			if (hrow.is_header && (int)hrow.label.size() > avail) {
+				// Wrap on word boundaries to fit kMaxChars per line.
+				constexpr int kMaxChars = 34;
+				std::vector<std::string> lines;
+				{
+					const std::string& s2 = hrow.label;
+					std::string cur;
+					size_t i = 0;
+					while (i < s2.size()) {
+						while (i < s2.size() && s2[i] == ' ') ++i;
+						if (i >= s2.size()) break;
+						size_t j = i;
+						while (j < s2.size() && s2[j] != ' ') ++j;
+						std::string word = s2.substr(i, j - i);
+						while ((int)word.size() > kMaxChars) {
+							std::string head = word.substr(0, kMaxChars);
+							word = word.substr(kMaxChars);
+							if (!cur.empty()) { lines.push_back(cur); cur.clear(); }
+							lines.push_back(head);
+						}
+						if (cur.empty()) cur = word;
+						else if ((int)(cur.size() + 1 + word.size()) <= kMaxChars)
+							cur += " " + word;
+						else { lines.push_back(cur); cur = word; }
+						i = j;
+					}
+					if (!cur.empty()) lines.push_back(cur);
+				}
+				if (lines.empty()) lines.push_back(hrow.label);
+
+				const int kLineH = GlyphH() + 2;  // dynamic: font height + 2px gap
+				constexpr int kPadX = 6;
+				constexpr int kPadY = 4;
+				int max_w = 0;
+				for (const auto& ln : lines) {
+					int w = (int)ln.size() * kGlyphW;
+					if (w > max_w) max_w = w;
+				}
+				int box_w = max_w + kPadX * 2;
+				int box_h = (int)lines.size() * kLineH + kPadY * 2 - 2;
+
+				// Anchor below the hovered row. Flip above if it would
+				// fall outside the row-list area; clamp horizontally so
+				// the whole box stays inside the tree pane.
+				int row_y = top + (idx - scroll) * kRowH;
+				int box_x = 4;
+				int box_y = row_y + kRowH + 2;
+				if (box_y + box_h > bottom - 2)
+					box_y = std::max(top, row_y - box_h - 2);
+				if (box_x + box_w > kTreeW - 6) box_x = kTreeW - 6 - box_w;
+				if (box_x < 4) box_x = 4;
+
+				FillRect(r, kBg, box_x, box_y, box_w, box_h);
+				OutlineRect(r, kAccent, box_x, box_y, box_w, box_h);
+				for (int li = 0; li < (int)lines.size(); ++li) {
+					DrawText(r, kText, box_x + kPadX,
+						box_y + kPadY + li * kLineH, lines[li].c_str());
+				}
+			}
+		}
 	}
 }
 
 void Gui::DrawInstrumentHeader(SDL_Renderer* r, const GuiState& s)
 {
-	int y = kHeaderH + 4;
-	FillRect(r, kPanel, kMainX + 4, y, kMainW - 8, 28);
-	FocusFrame(r, s, Editor::Panel::Name, kMainX + 4, y, kMainW - 8, 28);
+	const int y  = kInstrHdrY;
+	const int ph = kInstrHdrH;
+	FillRect(r, kPanel, kMainX + 4, y, kMainW - 8, ph);
+	FocusFrame(r, s, Editor::Panel::Name, kMainX + 4, y, kMainW - 8, ph);
 
 	bool have_rti = s.rti && s.rti->Valid();
 	bool have_instr = s.instrument != nullptr;
 	if (!have_rti && !have_instr) {
-		DrawText(r, kTextDim, kMainX + 16, y + 10, "No instrument loaded.");
+		DrawText(r, kTextDim, kMainX + 16, y + std::max(0, (ph - GlyphH()) / 2), "No instrument loaded.");
 		return;
 	}
 
@@ -974,39 +1140,64 @@ void Gui::DrawInstrumentHeader(SDL_Renderer* r, const GuiState& s)
 		name = s.rti->Name();
 	}
 
-	// Top text line: "Instrument: name  v1 (NN ATA) file: foo.rti".
-	// Bottom line is reserved for analysis metadata (tags + audio features).
-	DrawText(r, kHighlight, kMainX + 16, y + 4, "Instrument:");
+	// Top text line y: centred in the top half of the panel.
+	const int gh = GlyphH();
+	const int line1_y = y + std::max(0, (ph / 2 - gh) / 2);
+	const int line2_y = y + ph / 2 + std::max(0, (ph / 2 - gh) / 2);
+
+	// Line 1: "Instrument: name  v1 (NN ATA) file: foo.rti".
+	DrawText(r, kHighlight, kMainX + 16, line1_y, "Instrument:");
 
 	int name_x = kMainX + 120;
-	DrawTextF(r, kText, name_x, y + 4, "\"%s\"", name.c_str());
+	DrawTextF(r, kText, name_x, line1_y, "\"%s\"", name.c_str());
 
 	// Name-edit caret.
 	if (EditingPanel(s, Editor::Panel::Name)) {
 		int caret = name_x + (1 + s.editor->name_pos) * kGlyphW; // +1 for the quote
-		FillRect(r, kCellCursor, caret, y + 3, kGlyphW, 12);
+		FillRect(r, kCellCursor, caret, line1_y - 1, kGlyphW, gh + 2);
 		if (s.editor->name_pos < (int)name.size()) {
 			char ch[2] = { name[s.editor->name_pos], 0 };
-			DrawText(r, kBg, caret, y + 4, ch);
+			DrawText(r, kBg, caret, line1_y, ch);
 		}
 	}
 
 	int info_x = name_x + (int)(name.size() + 4) * kGlyphW;
 	if (have_rti) {
-		std::string file = s.rti->Path();
-		auto slash = file.find_last_of("/\\");
-		if (slash != std::string::npos) file = file.substr(slash + 1);
-		DrawTextF(r, kTextDim, info_x, y + 4, "v%d  (%zu ATA)  file: %s",
-			s.rti->Version(), s.rti->AtaBlob().size(), file.c_str());
+		DrawTextF(r, kTextDim, info_x, line1_y, "v%d  (%zu ATA) File",	s.rti->Version(), s.rti->AtaBlob().size());
 	}
 	else if (s.current_bank_slot >= 0) {
-		DrawTextF(r, kTextDim, info_x, y + 4, "(bank slot %02d)", s.current_bank_slot);
+		DrawTextF(r, kTextDim, info_x, line1_y, "(Bank slot %02d)", s.current_bank_slot);
 	}
 
-	// Second line: analysis metadata. Reads the current node's cached
-	// category / tags / audio features (populated by Analysis::Run /
-	// LoadAndApply). Hidden when no analysis is available so the header
-	// doesn't show a half-blank line on freshly-opened libraries.
+	// Undo / Redo / Revert buttons (right-aligned in the header bar).
+	// Single-glyph Unicode icons in compact pills: [↩] [↪] [↺]
+	{
+		const int kBtnH = gh + 4;
+		constexpr int kBtnW = 28, kBtnGap = 4;
+		int bx = kMainX + 4 + kMainW - 8 - (kBtnW * 3 + kBtnGap * 2) - 4;
+		int by = y + std::max(0, (ph / 2 - kBtnH) / 2);
+		bool can_undo = s.undo_depth > 0;
+		bool can_redo = s.redo_depth > 0;
+		// Arrows confirmed present in JetBrains Mono cmap:
+		//   U+21A9 ↩  U+21AA ↪  U+219E ↞  U+21D0 ⇐  U+21D2 ⇒  U+2190 ←  U+2192 →
+		// U+21BA ↺ and all circular/arc arrows are NOT in the font.
+		static const char* kUndo   = "\xe2\x86\xa9";  // U+21A9 ↩  hook-left
+		static const char* kRedo   = "\xe2\x86\xaa";  // U+21AA ↪  hook-right
+		static const char* kRevert = "\xe2\x86\x9e";  // U+219E ↞  two-headed left (revert-all)
+		auto DrawIconBtn = [&](int bxl, const char* icon, bool enabled) {
+			Col bg = enabled ? Col{ 55, 58, 70 } : Col{ 35, 36, 42 };
+			Col fg = enabled ? kText : kTextDim;
+			FillRect(r, bg, bxl, by, kBtnW, kBtnH);
+			OutlineRect(r, enabled ? kBorder : Col{ 45, 46, 52 }, bxl, by, kBtnW, kBtnH);
+			int iw = g_tr ? g_tr->MeasureWidth(icon) : kGlyphW;
+			DrawText(r, fg, bxl + std::max(0, (kBtnW - iw) / 2), by + std::max(0, (kBtnH - gh) / 2), icon);
+		};
+		DrawIconBtn(bx,                         kUndo,   can_undo);
+		DrawIconBtn(bx + kBtnW + kBtnGap,       kRedo,   can_redo);
+		DrawIconBtn(bx + (kBtnW + kBtnGap) * 2, kRevert, have_rti || have_instr);
+	}
+
+	// Second line: analysis metadata.
 	if (s.dir) {
 		int cur = s.dir->CurrentNodeIndex();
 		if (cur >= 0) {
@@ -1016,18 +1207,15 @@ void Gui::DrawInstrumentHeader(SDL_Renderer* r, const GuiState& s)
 				char buf[256];
 				int  pos = 0;
 				if (eff_cat >= 0) {
-					pos += std::snprintf(buf + pos, sizeof(buf) - pos,
-						"Cat: %s", Analysis::Name((Analysis::Category)eff_cat));
+					pos += std::snprintf(buf + pos, sizeof(buf) - pos, "Cat: %s", Analysis::Name((Analysis::Category)eff_cat));
 					if (n.manual_category >= 0)
 						pos += std::snprintf(buf + pos, sizeof(buf) - pos, " [M]");
 					if (n.confidence > 0)
-						pos += std::snprintf(buf + pos, sizeof(buf) - pos,
-							" (conf %d)", n.confidence);
+						pos += std::snprintf(buf + pos, sizeof(buf) - pos, " (conf %d)", n.confidence);
 					pos += std::snprintf(buf + pos, sizeof(buf) - pos, "   ");
 				}
 				if (n.tags) {
-					pos += std::snprintf(buf + pos, sizeof(buf) - pos,
-						"Tags: %s   ", Analysis::TagsToString(n.tags).c_str());
+					pos += std::snprintf(buf + pos, sizeof(buf) - pos, "Tags: %s   ", Analysis::TagsToString(n.tags).c_str());
 				}
 				if (n.audio_valid) {
 					pos += std::snprintf(buf + pos, sizeof(buf) - pos,
@@ -1036,7 +1224,7 @@ void Gui::DrawInstrumentHeader(SDL_Renderer* r, const GuiState& s)
 						(n.audio[0] + n.audio[1] + n.audio[2]) / 3.0f,
 						n.audio[3], n.audio[7]);
 				}
-				DrawText(r, kTextDim, kMainX + 16, y + 18, buf);
+				DrawText(r, kTextDim, kMainX + 16, line2_y, buf);
 			}
 		}
 	}
@@ -1059,9 +1247,9 @@ namespace {
 void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 {
 	int x0 = kMainX + 2;
-	int y0 = kHeaderH + 38;
+	int y0 = kParamY0;
 	int w = kMainW - 4;
-	int h = 116;
+	int h = kParamH;
 
 	FillRect(r, kPanelDark, x0, y0, w, h);
 	OutlineRect(r, kBorder, x0, y0, w, h);
@@ -1075,22 +1263,26 @@ void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 		return;
 	}
 	const int* par = s.instrument->parameters;
+	const int gh = GlyphH();
 
 	// 12 named params in 2 columns of 6.
 	for (int i = 0; i < 12; ++i) {
 		int col = i / 6;
 		int row = i % 6;
 		int x = x0 + 16 + col * 220;
-		int y = y0 + 26 + row * 14;
-		DrawTextF(r, kText, x, y, "%s : %02X",
+		int ry = y0 + 28 + row * kParamRowH;  // top of the row slot
+		DrawTextF(r, kText, x, ry + std::max(0, (kParamRowH - gh) / 2), "%s : %02X",
 			kParamLabels[i].name, par[kParamLabels[i].idx] & 0xFF);
 	}
 
 	// AUDCTL flags, 8 bits as a 4x2 grid of wide toggles (room for labels).
 	int ax = x0 + 460;
-	int ay = y0 + 26;
-	constexpr int kFlagW = 88, kFlagH = 18, kFlagSX = 92, kFlagSY = 22;
-	DrawText(r, kHighlight, ax, ay, "AUDCTL  (right-click toggles)");
+	int ay = y0 + 28;
+	const int kFlagH = gh + 4;   // button height: just tall enough for the font
+	constexpr int kFlagW = 88, kFlagSX = 92;
+	const int kFlagSY = kFlagH + 4;   // row stride
+	// "AUDCTL" header label row
+	DrawText(r, kHighlight, ax, ay + std::max(0, (kFlagSY - gh) / 2), "AUDCTL  (click to toggle)");
 	static const char* names[8] = {
 		"15kHz", "HPF 2", "HPF 1", "Join3-4",
 		"Join1-2", "1.79MHz3", "1.79MHz1", "Poly9"
@@ -1101,12 +1293,12 @@ void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 	};
 	for (int i = 0; i < 8; ++i) {
 		int col = i % 4, row = i / 4;
-		int bx = ax + col * kFlagSX, by = ay + 14 + row * kFlagSY;
+		int bx = ax + col * kFlagSX, by = ay + kFlagSY + row * kFlagSY;
 		bool on = par[idxs[i]] != 0;
 		Col cell = on ? kAccent : kBankEmpty;
 		FillRect(r, cell, bx, by, kFlagW, kFlagH);
 		OutlineRect(r, kBorder, bx, by, kFlagW, kFlagH);
-		DrawText(r, on ? kBg : kTextDim, bx + 4, by + 5, names[i]);
+		DrawText(r, on ? kBg : kTextDim, bx + 4, by + std::max(0, (kFlagH - gh) / 2), names[i]);
 	}
 
 	// Edit cursor.
@@ -1115,15 +1307,15 @@ void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 		if (ci < 12) {
 			int col = ci / 6, row = ci % 6;
 			int cx = x0 + 16 + col * 220;
-			int cy = y0 + 26 + row * 14;
-			CellCursor(r, cx - 2, cy - 2, 210, 13);
+			int cy = y0 + 28 + row * kParamRowH;
+			CellCursor(r, cx - 2, cy - 1, 210, kParamRowH);
 		}
 		else {
 			int fi = ci - 12;
 			if (fi >= 0 && fi < 8) {
 				int col = fi % 4, row = fi / 4;
-				CellCursor(r, ax + col * kFlagSX - 1, ay + 14 + row * kFlagSY - 1,
-					kFlagW + 1, kFlagH + 1);
+				CellCursor(r, ax + col * kFlagSX - 1, ay + kFlagSY + row * kFlagSY - 1,
+					kFlagW + 2, kFlagH + 2);
 			}
 		}
 	}
@@ -1132,16 +1324,53 @@ void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 void Gui::DrawEnvelope(SDL_Renderer* r, const GuiState& s)
 {
 	int x0 = kMainX + 2;
-	int y0 = kHeaderH + 160;
+	int y0 = kEnvY0;
 	int w = kMainW - 4;
 	int h = 200;
 
 	FillRect(r, kPanelDark, x0, y0, w, h);
 	OutlineRect(r, kBorder, x0, y0, w, h);
 	FocusFrame(r, s, Editor::Panel::Envelope, x0, y0, w, h);
-	DrawSectionTitle(r, x0 + 8, y0 + 6, w - 16,
-		EditingPanel(s, Editor::Panel::Envelope)
-		? "Envelope  [EDITING - Tab to switch]" : "Envelope");
+	// Section title and right-aligned controls. The "[EDITING - Tab to
+	// switch]" hint used to live next to the title but its full width
+	// overlapped the mini-volume graph (which starts ~10 glyphs into the
+	// header strip). Moved next to the Mono/Stereo toggle on the right so
+	// the title can stay short ("Envelope") and the centre header stays
+	// clear for the volume strip.
+	const bool envelope_editing = EditingPanel(s, Editor::Panel::Envelope);
+	const char* kEditingHint    = "[EDITING - Tab to switch]";
+	const int   kEditingHintW   = (int)std::strlen(kEditingHint) * GlyphW();
+	const int   kEditingGap     = 8;       // gap between hint and toggle
+	{
+		const int kTglW = GlyphW() * 6 + 8;  // 6 chars ("Stereo") + padding
+		// The title text itself is always just "Envelope" - the EDITING
+		// hint sits next to the toggle on the far right rather than after
+		// the title - so the section title's underline only needs to skip
+		// the toggle button. Keeping the underline at this fixed width
+		// regardless of editing state lets it span all the way under the
+		// mini-volume graph and the EDITING hint, instead of stopping
+		// right after the word "Envelope".
+		DrawSectionTitle(r, x0 + 8, y0 + 6, w - 16 - kTglW - 4, "Envelope");
+
+		// Mono / Stereo toggle button (top-right of section).
+		const int bw = kTglW, bh = GlyphH() + 4;
+		const int bx = x0 + w - 8 - bw, by = y0 + 4;
+		Col btn_bg  = s.instr_stereo ? Col{50, 80, 130} : Col{30, 34, 44};
+		Col btn_txt = s.instr_stereo ? kAccent : kTextDim;
+		Col btn_brd = s.instr_stereo ? kAccent : kBorder;
+		FillRect(r, btn_bg, bx, by, bw, bh);
+		OutlineRect(r, btn_brd, bx, by, bw, bh);
+		const char* sym = s.instr_stereo ? "Stereo" : "Mono";
+		DrawText(r, btn_txt, bx + 4, by + 2, sym);
+
+		// "[EDITING - Tab to switch]" sits immediately left of the toggle
+		// button and only appears in edit mode. Same vertical centre line
+		// as the toggle so the two read as a single control cluster.
+		if (envelope_editing) {
+			int hint_x = bx - kEditingGap - kEditingHintW;
+			DrawText(r, kHighlight, hint_x, by + 1, kEditingHint);
+		}
+	}
 
 	if (!s.instrument) return;
 	const int* par = s.instrument->parameters;
@@ -1158,26 +1387,111 @@ void Gui::DrawEnvelope(SDL_Renderer* r, const GuiState& s)
 	int cell_w = std::max(8, grid_w / std::max(cells, 16));
 	if (cell_w > 24) cell_w = 24;
 
-	int grid_y = y0 + 26;
+	int grid_y = y0 + 32;
 	int cell_h = 18;
+
+	// Mini vol graph: bar chart in the envelope header strip (y0+5 to y0+27).
+	// Starts well past the "Envelope" label text so they don't overlap, and
+	// stops short of the right-hand controls (toggle button, and the
+	// "[EDITING - Tab to switch]" hint when present).
+	// Mono: only VolL (cyan). Stereo: VolR (orange) left half, VolL (cyan) right half.
+	if (s.instrument) {
+		const int kTglW2     = GlyphW() * 6 + 8;  // toggle button width (same as above)
+		const int strip_x    = x0 + 8 + GlyphW() * 10; // past "Envelope" text + margin
+		const int right_pad  = kTglW2 + 4 +	(envelope_editing ? (kEditingHintW + kEditingGap) : 0);
+		const int strip_end  = x0 + w - 8 - right_pad;
+		const int strip_top  = y0 + 3;
+		const int strip_base = y0 + 25;
+		const int strip_h    = strip_base - strip_top;
+		const int ncols2    = env_len + 1;
+		const int scw       = 12;  // fixed 12 px per column
+		for (int c = 0; c < ncols2; ++c) 
+		{
+			int sx = strip_x + c * scw;
+			if (sx + scw > strip_end) break;   // don't spill into the toggle / EDITING area
+			int vl = s.instrument->envelope[c][VOLUMEL] & 0xF;
+			if (s.instr_stereo) 
+			{
+				int vr = s.instrument->envelope[c][VOLUMER] & 0xF;
+				const int half_w = std::max(1, scw / 2 - 1);
+				if (vr > 0) {
+					int bh = vr * strip_h / 15;
+					FillRect(r, Col{220, 140, 40}, sx, strip_base - bh, half_w, bh);
+				}
+				if (vl > 0) {
+					int bh = vl * strip_h / 15;
+					FillRect(r, Col{40, 195, 185}, sx + half_w + 1, strip_base - bh, half_w, bh);
+				}
+			} else {
+				if (vl > 0) {
+					int bh = vl * strip_h / 15;
+					FillRect(r, Col{40, 195, 185}, sx, strip_base - bh, scw - 1, bh);
+				}
+			}
+		}
+		// Baseline + goto marker also stop at strip_end so they don't
+		// underline the EDITING hint or the toggle button.
+		int strip_w = std::min(ncols2 * scw, strip_end - strip_x);
+		FillRect(r, Col{60, 64, 72}, strip_x, strip_base, strip_w, 1);
+		int go = par[PAR_ENV_GOTO];
+		if (go >= 0 && go <= env_len) {
+			int goto_x = strip_x + go * scw + scw - 1;
+			if (goto_x + 2 <= strip_end)
+				FillRect(r, kBankCurrent, goto_x, y0 + 2, 2, strip_h + 2);
+		}
+	}
 
 	for (int row = 0; row < ENVROWS; ++row) {
 		int rx = x0 + 12;
 		int ry = grid_y + row * (cell_h + 2);
-		DrawText(r, kTextDim, rx, ry + 5, row_names[row]);
+		DrawText(r, kTextDim, rx, ry + std::max(0, (cell_h - GlyphH()) / 2), row_names[row]);
+		// In mono mode strike through the VolR label to indicate it is inactive.
+		if (row == VOLUMER && !s.instr_stereo) {
+			int ly = ry + std::max(0, (cell_h - GlyphH()) / 2) + GlyphH() / 2;
+			FillRect(r, kTextDim, rx, ly, GlyphW() * 4, 1);
+		}
 
 		for (int c = 0; c <= env_len; ++c) {
 			int v = s.instrument->envelope[c][row];
 			int cx = grid_x + c * cell_w;
 			int cy = ry;
 
-			// Colour by value intensity.
-			Uint8 g = (Uint8)std::min(220, 40 + v * 18);
-			Col fill{ kEnvCell.r, g, kEnvCell.b };
-			FillRect(r, fill, cx, cy, cell_w - 1, cell_h);
+			// Colour by value intensity; VolR/VolL get a vertical bar background.
+			Col fill;
+			if (row == VOLUMER || row == VOLUMEL) {
+				// Dark background cell
+				fill = Col{ 26, 30, 38 };
+				FillRect(r, fill, cx, cy, cell_w - 1, cell_h);
+				// Colored bar growing from the bottom
+				int bh = v * (cell_h - 2) / 15;
+				if (bh > 0) {
+					Col bar_col = (row == VOLUMER)
+						? Col{200, 120, 30}    // orange for VolR
+						: Col{30,  175, 165};  // cyan for VolL
+					FillRect(r, bar_col, cx, cy + cell_h - 1 - bh, cell_w - 1, bh);
+				}
+			} else {
+				Uint8 g = (Uint8)std::min(220, 40 + v * 18);
+				fill = Col{ kEnvCell.r, g, kEnvCell.b };
+				FillRect(r, fill, cx, cy, cell_w - 1, cell_h);
+			}
 			char buf[4];
 			std::snprintf(buf, sizeof(buf), "%X", v & 0xF);
-			DrawText(r, kBg, cx + (cell_w >= 12 ? cell_w / 2 - 4 : 1), cy + 5, buf);
+			// VolR/VolL cells: white text on the coloured bar background.
+			Col txt_col = (row == VOLUMER || row == VOLUMEL) ? kText : kBg;
+			DrawText(r, txt_col, cx + (cell_w >= 12 ? cell_w / 2 - 4 : 1), cy + std::max(0, (cell_h - GlyphH()) / 2), buf);
+
+			// Distortion row: show abbreviated mode name when cells are wide enough
+			// and the font is small enough to fit two lines.
+			if (row == (int)DISTORTION && cell_w >= 24 && GlyphH() * 2 <= cell_h) {
+				static const char* kDistAbbr[] = {
+					"Buz","Buz","Pat","Pat",
+					"Bas","Bas","His","His",
+					"Pur","Pur","BB ","BB ",
+					"B2 ","B2 ","---","---"
+				};
+				DrawText(r, kBg, cx + 1, cy + GlyphH(), kDistAbbr[std::clamp(v, 0, 15)]);
+			}
 		}
 		// Mark the envelope goto column with a thin red bar.
 		int g_c = par[PAR_ENV_GOTO];
@@ -1200,9 +1514,11 @@ void Gui::DrawEnvelope(SDL_Renderer* r, const GuiState& s)
 void Gui::DrawNoteTable(SDL_Renderer* r, const GuiState& s)
 {
 	int x0 = kMainX + 2;
-	int y0 = kHeaderH + 366;
+	int y0 = kNoteTableY0;
 	int w = kMainW - 4;
-	int h = 64;
+	// Fixed panel height regardless of notes_mode — no layout bounce when switching.
+	bool notes_mode = s.instrument && s.instrument->parameters[PAR_TBL_TYPE] == 0;
+	constexpr int h = 78;
 
 	FillRect(r, kPanelDark, x0, y0, w, h);
 	OutlineRect(r, kBorder, x0, y0, w, h);
@@ -1220,28 +1536,345 @@ void Gui::DrawNoteTable(SDL_Renderer* r, const GuiState& s)
 	int gw = w - 24 - label_w;
 	int cell_w = std::max(16, gw / 32);
 	if (cell_w > 24) cell_w = 24;
-	int gy = y0 + 24;
+	int gy = y0 + 30;  // title text at y0+6, underline at y0+24; leave 6px gap below it
 
-	DrawText(r, kTextDim, x0 + 12, gy + 5, "Step");
+	const int gh = GlyphH();
+	const int cell_h_note = std::max(20, gh + 4);  // cell height tall enough for font
+	DrawText(r, kTextDim, x0 + 12, gy + std::max(0, (cell_h_note - gh) / 2), "Step");
 	for (int i = 0; i <= tbl_len && i < NOTE_TABLE_MAX_LEN; ++i) {
 		Col c = (i == par[PAR_TBL_GOTO]) ? kHighlight : kEnvCell;
-		FillRect(r, c, gx + i * cell_w, gy, cell_w - 1, 22);
-		DrawTextF(r, kBg, gx + i * cell_w + 2, gy + 5, "%02X",
+		FillRect(r, c, gx + i * cell_w, gy, cell_w - 1, cell_h_note);
+		DrawTextF(r, kBg, gx + i * cell_w + 2, gy + std::max(0, (cell_h_note - gh) / 2), "%02X",
 			s.instrument->noteTable[i] & 0xFF);
+	}
+
+	// Second row: note names (Notes mode only).
+	if (notes_mode) {
+		static const char* kNoteNames[] = {
+			"C-","C#","D-","D#","E-","F-","F#","G-","G#","A-","A#","B-"
+		};
+		int gy2 = gy + cell_h_note + 2;
+		DrawText(r, kTextDim, x0 + 12, gy2 + std::max(0, (cell_h_note - gh) / 2), "Note");
+		for (int i = 0; i <= tbl_len && i < NOTE_TABLE_MAX_LEN; ++i) {
+			int raw = (int)(int8_t)(Uint8)s.instrument->noteTable[i];
+			int abs_semi = 48 + raw;   // 48 = C-4 as semitone 0
+			FillRect(r, kPanelDark, gx + i * cell_w, gy2, cell_w - 1, cell_h_note);
+			if (abs_semi >= 0 && abs_semi < 96) {
+				int oct  = abs_semi / 12;
+				int note = abs_semi % 12;
+				char nbuf[5];
+				std::snprintf(nbuf, sizeof(nbuf), "%s%d", kNoteNames[note], oct);
+				DrawText(r, kTextDim, gx + i * cell_w + 1, gy2 + std::max(0, (cell_h_note - gh) / 2), nbuf);
+			} else {
+				DrawText(r, kTextDim, gx + i * cell_w + 1, gy2 + std::max(0, (cell_h_note - gh) / 2), "???");
+			}
+		}
 	}
 
 	// Edit cursor.
 	if (EditingPanel(s, Editor::Panel::NoteTable)) {
 		int i = std::clamp(s.editor->tbl_idx, 0, tbl_len);
-		CellCursor(r, gx + i * cell_w, gy, cell_w - 1, 22);
+		CellCursor(r, gx + i * cell_w, gy, cell_w - 1, cell_h_note);
+	}
+}
+
+char Gui::InstrHeaderButtonAt(int x, int y) const
+{
+	if (y < kInstrHdrY || y >= kInstrHdrY + kInstrHdrH / 2) return 0;  // top half only
+	constexpr int kBtnW = 28, kBtnGap = 4;
+	int bx = kMainX + 4 + kMainW - 8 - (kBtnW * 3 + kBtnGap * 2) - 4;
+	if (x >= bx && x < bx + kBtnW)                                  return 'u';
+	if (x >= bx + kBtnW + kBtnGap && x < bx + kBtnW * 2 + kBtnGap) return 'r';
+	if (x >= bx + (kBtnW + kBtnGap) * 2 && x < bx + kBtnW * 3 + kBtnGap * 2) return 'v';
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Volume bar-graph popup
+// ---------------------------------------------------------------------------
+
+namespace {
+	// Shared geometry used by DrawVolPopup, PointInVolPopup, VolPopupCellAt,
+	// PointInVolGotoHandle, VolGotoColAt, and VolCopyButtonAt.
+	// Keep these consistent with each other.
+	constexpr int kVpW           = 840;
+	constexpr int kVpH           = 350;   // expanded for goto strip + copy buttons
+	constexpr int kVpBarMaxH     = 110;   // v=15 → 110 px
+	constexpr int kVpLabelW      = 40;
+	constexpr int kVpBarAreaX    = 8 + kVpLabelW + 8;   // offset from px
+	constexpr int kVpBarAreaW    = kVpW - kVpBarAreaX - 8;
+	constexpr int kVpVolRSY      = 32;    // VolR section top (offset from py)
+	constexpr int kVpVolLSY      = kVpVolRSY + kVpBarMaxH + 40;  // VolL section top; 40px gap for copy buttons
+	// VolR baseline = py + kVpVolRSY + kVpBarMaxH (= py + 142)
+	// VolL baseline = py + kVpVolLSY + kVpBarMaxH (= py + 292)
+	// Copy buttons sit in the stereo gap (py+142 to py+182):
+	constexpr int kVpCopyLabelSY = kVpVolRSY + kVpBarMaxH + 2;   // = 144
+	constexpr int kVpCopyBtnSY   = kVpVolRSY + kVpBarMaxH + 22;  // = 164
+	constexpr int kVpCopyBtnH    = 16;
+	constexpr int kVpCopyBtnW    = 24;   // 2 glyphs (8px each) + 8px padding
+	// Goto handle strip below VolL:
+	constexpr int kVpGotoStripSY = kVpVolLSY + kVpBarMaxH + 10;  // = 302
+	constexpr int kVpGotoStripH  = 22;
+}
+
+bool Gui::PointInVolPopup(int x, int y) const
+{
+	int px = (kWinW - kVpW) / 2;
+	int py = (kWinH - kVpH) / 2;
+	return x >= px && x < px + kVpW && y >= py && y < py + kVpH;
+}
+
+bool Gui::PointInVolGraph(int x, int y) const
+{
+	int x0 = kMainX + 2;
+	int y0 = kEnvY0;
+	int w  = kMainW - 4;
+	const int kTglW  = GlyphW() * 2 + 8;
+	const int strip_x   = x0 + 8 + GlyphW() * 10;
+	const int strip_end = x0 + w - 8 - kTglW - 4;
+	return x >= strip_x && x < strip_end && y >= y0 + 5 && y < y0 + 28;
+}
+
+Gui::VolPopupHit Gui::VolPopupCellAt(int x, int y, const TInstrument& ins, bool stereo) const
+{
+	VolPopupHit r;
+	if (!m_vol_popup_open) return r;
+	int px = (kWinW - kVpW) / 2;
+	int py = (kWinH - kVpH) / 2;
+	int env_len = ins.parameters[PAR_ENV_LENGTH];
+	int ncols   = std::max(1, env_len + 1);
+	int bar_w   = std::clamp(kVpBarAreaW / ncols, 4, 24);
+	int bax     = px + kVpBarAreaX;
+
+	// Test one section.  Divides height into 16 equal zones so every value
+	// 0-15 has the same sized click target (kVpBarMaxH/16 px each).
+	auto trySection = [&](int sy_offset, int row_idx) -> bool {
+		int sec_sy = py + sy_offset;
+		if (y < sec_sy || y >= sec_sy + kVpBarMaxH) return false;
+		int col = (x - bax) / bar_w;
+		if (x < bax || col < 0 || col > env_len) return false;
+		r.hit   = true;
+		r.row   = row_idx;
+		r.col   = col;
+		r.value = std::clamp(15 - (y - sec_sy) * 16 / kVpBarMaxH, 0, 15);
+		return true;
+	};
+
+	// Both sections are always drawn at fixed positions; mono sync is
+	// handled by the drag callbacks, not here.
+	if (trySection(kVpVolRSY, VOLUMER)) return r;
+	if (trySection(kVpVolLSY, VOLUMEL)) return r;
+	return r;
+}
+
+bool Gui::PointInStereoToggle(int x, int y) const
+{
+	const int kTglW = GlyphW() * 6 + 8;
+	const int bh    = GlyphH() + 4;
+	const int bx    = kMainX + 2 + (kMainW - 4) - 8 - kTglW;
+	const int by    = kEnvY0 + 4;
+	return x >= bx && x < bx + kTglW && y >= by && y < by + bh;
+}
+
+bool Gui::PointInVolGotoHandle(int x, int y, const TInstrument& ins) const
+{
+	if (!m_vol_popup_open) return false;
+	int px = (kWinW - kVpW) / 2;
+	int py = (kWinH - kVpH) / 2;
+	int gy = py + kVpGotoStripSY;
+	if (y < gy || y >= gy + kVpGotoStripH) return false;
+	int bax = px + kVpBarAreaX;
+	return x >= bax && x < bax + kVpBarAreaW;
+}
+
+int Gui::VolGotoColAt(int x, const TInstrument& ins) const
+{
+	int px  = (kWinW - kVpW) / 2;
+	int bax = px + kVpBarAreaX;
+	int env_len = ins.parameters[PAR_ENV_LENGTH];
+	int ncols   = std::max(1, env_len + 1);
+	int bar_w   = std::clamp(kVpBarAreaW / ncols, 4, 24);
+	return std::clamp((x - bax) / bar_w, 0, env_len);
+}
+
+char Gui::VolCopyButtonAt(int x, int y) const
+{
+	if (!m_vol_popup_open) return 0;
+	int px  = (kWinW - kVpW) / 2;
+	int py  = (kWinH - kVpH) / 2;
+	int by  = py + kVpCopyBtnSY;
+	int lbx = px + kVpW / 2 - kVpCopyBtnW - 4;
+	int rbx = px + kVpW / 2 + 4;
+	if (y >= by && y < by + kVpCopyBtnH) {
+		if (x >= lbx && x < lbx + kVpCopyBtnW) return 'L';
+		if (x >= rbx && x < rbx + kVpCopyBtnW) return 'R';
+	}
+	return 0;
+}
+
+bool Gui::PointInVolPopupStereoToggle(int x, int y) const
+{
+	if (!m_vol_popup_open) return false;
+	int px  = (kWinW - kVpW) / 2;
+	int py  = (kWinH - kVpH) / 2;
+	int btw = GlyphW() * 6 + 8;
+	int bth = GlyphH() + 4;
+	int btx = px + kVpW - 8 - btw;
+	int bty = py + 8;
+	return x >= btx && x < btx + btw && y >= bty && y < bty + bth;
+}
+
+void Gui::DrawVolPopup(SDL_Renderer* r, const GuiState& s)
+{
+	if (!s.instrument) return;
+
+	// Dim background
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+	FillRect(r, Col{0, 0, 0, 160}, 0, 0, kWinW, kWinH);
+	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
+
+	int px = (kWinW - kVpW) / 2;
+	int py = (kWinH - kVpH) / 2;
+	FillRect(r, Col{22, 26, 34}, px, py, kVpW, kVpH);
+	OutlineRect(r, kAccent,   px,     py,     kVpW,     kVpH);
+	OutlineRect(r, kBorder,   px + 1, py + 1, kVpW - 2, kVpH - 2);
+
+	DrawText(r, kHighlight,  px + 10, py + 10, "Volume Envelope  \xe2\x80\x94  drag bars to draw");
+	DrawText(r, kTextDim,    px + 10, py + kVpH - GlyphH() - 8,
+		"ESC or click outside to close");
+
+	const TInstrument& ins = *s.instrument;
+	int env_len = ins.parameters[PAR_ENV_LENGTH];
+	int go_col  = ins.parameters[PAR_ENV_GOTO];
+	int ncols   = std::max(1, env_len + 1);
+	int bar_w   = std::clamp(kVpBarAreaW / ncols, 4, 24);
+	int bax     = px + kVpBarAreaX;
+
+	struct Section {
+		const char* label;
+		int         row_idx;
+		int         sy;
+		Col         bar_col;
+		Col         bar_hi;
+	};
+
+	// Always show both sections; mono mode keeps them in sync via drag callbacks.
+	const int n_sections = 2;
+	Section sections[2] = {
+		{ "VolR", VOLUMER, kVpVolRSY, Col{210, 130, 35},  Col{240, 175, 60}  },
+		{ "VolL", VOLUMEL, kVpVolLSY, Col{30,  170, 160}, Col{60,  210, 200} },
+	};
+	// Mono/Stereo toggle button (top-right corner of popup).
+	{
+		int btw = GlyphW() * 6 + 8;
+		int bth = GlyphH() + 4;
+		int btx = px + kVpW - 8 - btw;
+		int bty = py + 8;
+		Col bt_bg  = s.instr_stereo ? Col{50, 80, 130} : Col{30, 34, 44};
+		Col bt_txt = s.instr_stereo ? kAccent : kTextDim;
+		Col bt_brd = s.instr_stereo ? kAccent : kBorder;
+		FillRect(r, bt_bg, btx, bty, btw, bth);
+		OutlineRect(r, bt_brd, btx, bty, btw, bth);
+		DrawText(r, bt_txt, btx + 4, bty + 2, s.instr_stereo ? "Stereo" : "Mono");
+	}
+
+	for (int si = 0; si < n_sections; ++si) {
+		auto& sec    = sections[si];
+		int sy       = py + sec.sy;
+		int baseline = sy + kVpBarMaxH;
+
+		DrawText(r, kText, px + 8, sy + kVpBarMaxH / 2 - GlyphH() / 2, sec.label);
+
+		// Horizontal gridlines at 0, 4, 8, 12, 15 with hex labels
+		for (int v : {0, 4, 8, 12, 15}) {
+			int gy = baseline - v * kVpBarMaxH / 15;
+			FillRect(r, Col{45, 49, 58}, bax, gy, kVpBarAreaW, 1);
+			char buf[4];
+			std::snprintf(buf, sizeof(buf), "%X", v);
+			DrawText(r, Col{80, 84, 92}, bax - GlyphW() * (int)std::strlen(buf) - 4,
+				gy - GlyphH() / 2, buf);
+		}
+
+		for (int c = 0; c <= env_len; ++c) {
+			int v  = ins.envelope[c][sec.row_idx] & 0xF;
+			int bx = bax + c * bar_w;
+			int bh = v * kVpBarMaxH / 15;
+
+			FillRect(r, Col{35, 39, 48}, bx, sy, bar_w - 1, kVpBarMaxH);
+			if (bh > 0) {
+				bool active = s.editor && s.editor->active
+					&& s.editor->panel == Editor::Panel::Envelope
+					&& s.editor->env_col == c
+					&& s.editor->env_row == sec.row_idx;
+				FillRect(r, active ? sec.bar_hi : sec.bar_col,
+					bx, baseline - bh, bar_w - 1, bh);
+			}
+			if (s.editor && s.editor->active
+				&& s.editor->panel == Editor::Panel::Envelope
+				&& s.editor->env_col == c
+				&& s.editor->env_row == sec.row_idx) {
+				OutlineRect(r, kEditCursor, bx, sy, bar_w - 1, kVpBarMaxH);
+			}
+			if (c == go_col)
+				FillRect(r, kBankCurrent, bx + bar_w - 2, sy, 2, kVpBarMaxH + 4);
+		}
+	}
+
+	// Copy buttons in the stereo gap (py+142 to py+182) — stereo mode only.
+	if (s.instr_stereo) {
+		DrawText(r, kTextDim,
+			px + kVpW / 2 - GlyphW() * 6,
+			py + kVpCopyLabelSY,
+			"copy volume");
+		int by  = py + kVpCopyBtnSY;
+		int lbx = px + kVpW / 2 - kVpCopyBtnW - 4;
+		int rbx = px + kVpW / 2 + 4;
+		// Left button: ↑ copies VolL up to VolR
+		FillRect(r,  Col{40, 55, 80}, lbx, by, kVpCopyBtnW, kVpCopyBtnH);
+		OutlineRect(r, kBorder,        lbx, by, kVpCopyBtnW, kVpCopyBtnH);
+		DrawText(r, kText, lbx + kVpCopyBtnW / 2 - GlyphW() / 2,
+			by + (kVpCopyBtnH - GlyphH()) / 2, "\xe2\x86\x91");
+		// Right button: ↓ copies VolR down to VolL
+		FillRect(r,  Col{40, 55, 80}, rbx, by, kVpCopyBtnW, kVpCopyBtnH);
+		OutlineRect(r, kBorder,        rbx, by, kVpCopyBtnW, kVpCopyBtnH);
+		DrawText(r, kText, rbx + kVpCopyBtnW / 2 - GlyphW() / 2,
+			by + (kVpCopyBtnH - GlyphH()) / 2, "\xe2\x86\x93");
+	}
+
+	// Goto handle strip — draggable red marker below VolL.
+	{
+		int gy = py + kVpGotoStripSY;
+		// Background
+		FillRect(r, Col{28, 32, 42}, bax, gy, kVpBarAreaW, kVpGotoStripH);
+		// Center rail
+		FillRect(r, Col{50, 55, 68}, bax, gy + kVpGotoStripH / 2, kVpBarAreaW, 1);
+		// "Goto:N" label in the left margin
+		char gbuf[16];
+		std::snprintf(gbuf, sizeof(gbuf), "Goto:%d", go_col);
+		DrawText(r, kTextDim, px + 8, gy + (kVpGotoStripH - GlyphH()) / 2, gbuf);
+		// Draggable thumb at the right edge of goto column
+		int hx = bax + go_col * bar_w + bar_w - 1;
+		FillRect(r, kBankCurrent, hx - 4, gy + 2, 8, kVpGotoStripH - 4);
 	}
 }
 
 bool Gui::PointInBankEdit(int x, int y) const
 {
 	BankGeom g = ComputeBankGeom();
-	int ebx = g.panel_x + g.panel_w - 70, eby = g.panel_y + 2, ebw = 62, ebh = 16;
+	const int ebh = 20;  // conservative hit area for the EDIT button
+	int ebx = g.panel_x + g.panel_w - 70, eby = g.panel_y + 4, ebw = 62;
 	return x >= ebx && x < ebx + ebw && y >= eby && y < eby + ebh;
+}
+
+bool Gui::PointInBankAnalyse(int x, int y) const
+{
+	BankGeom g = ComputeBankGeom();
+	const int ebh = 20;             // same conservative band as EDIT
+	const int abw = 78;
+	int ebx = g.panel_x + g.panel_w - 70;
+	int abx = ebx - 8 - abw;
+	int aby = g.panel_y + 4;
+	return x >= abx && x < abx + abw && y >= aby && y < aby + ebh;
 }
 
 int Gui::BankSlotAtLogical(int x, int y) const
@@ -1260,10 +1893,10 @@ Gui::EditHit Gui::EditFieldAtLogical(int x, int y, const TInstrument& ins) const
 {
 	EditHit r;
 
-	// --- Instrument header (Name) ---  y in [kHeaderH+4, +32]
+	// --- Instrument header (Name) ---
 	{
-		int hy = kHeaderH + 4;
-		if (y >= hy && y < hy + 28 && x >= kMainX + 4 && x < kMainX + 4 + kMainW - 8) {
+		if (y >= kInstrHdrY && y < kInstrHdrY + kInstrHdrH / 2 &&
+			x >= kMainX + 4 && x < kMainX + 4 + kMainW - 8) {
 			int name_x = kMainX + 120 + kGlyphW; // past the opening quote
 			int pos = (x - name_x) / kGlyphW;
 			r.hit = true; r.panel = Editor::Panel::Name;
@@ -1272,32 +1905,34 @@ Gui::EditHit Gui::EditFieldAtLogical(int x, int y, const TInstrument& ins) const
 		}
 	}
 
-	// --- Parameters --- panel at (kMainX+8, kHeaderH+38, kMainW-16, 116)
+	// --- Parameters ---
 	{
-		int x0 = kMainX + 2, y0 = kHeaderH + 38;
-		// 12 named params: 2 columns of 6, cells ~210x13 on a 220x14 grid.
+		int x0 = kMainX + 2, y0 = kParamY0;
+		// 12 named params: 2 columns of 6.
 		for (int i = 0; i < 12; ++i) {
 			int col = i / 6, row = i % 6;
 			int cx = x0 + 16 + col * 220;
-			int cy = y0 + 26 + row * 14;
-			if (x >= cx - 2 && x < cx + 208 && y >= cy - 2 && y < cy + 11) {
+			int cy = y0 + 28 + row * kParamRowH;
+			if (x >= cx - 2 && x < cx + 208 && y >= cy && y < cy + kParamRowH) {
 				r.hit = true; r.panel = Editor::Panel::Params; r.a = i; return r;
 			}
 		}
 		// 8 AUDCTL flag boxes (4x2 grid, must match DrawParameters).
-		int ax = x0 + 460, ay = y0 + 26;
+		int ax = x0 + 460, ay = y0 + 28;
+		const int kFlagH_ht = 22;  // generous hit area (slightly larger than drawn)
+		constexpr int kFlagSX_ht = 92, kFlagSY_ht = 22;
 		for (int fi = 0; fi < 8; ++fi) {
 			int col = fi % 4, row = fi / 4;
-			int bx = ax + col * 92, by = ay + 14 + row * 22;
-			if (x >= bx && x < bx + 88 && y >= by && y < by + 18) {
+			int bx = ax + col * kFlagSX_ht, by = ay + kFlagSY_ht + row * kFlagSY_ht;
+			if (x >= bx && x < bx + 88 && y >= by && y < by + kFlagH_ht) {
 				r.hit = true; r.panel = Editor::Panel::Params; r.a = 12 + fi; return r;
 			}
 		}
 	}
 
-	// --- Envelope --- panel at (kMainX+8, kHeaderH+160, kMainW-16, 200)
+	// --- Envelope ---
 	{
-		int x0 = kMainX + 2, y0 = kHeaderH + 160, w = kMainW - 4;
+		int x0 = kMainX + 2, y0 = kEnvY0, w = kMainW - 4;
 		int env_len = ins.parameters[PAR_ENV_LENGTH];
 		int label_w = 44;
 		int grid_x = x0 + 8 + label_w + 8;
@@ -1305,7 +1940,7 @@ Gui::EditHit Gui::EditFieldAtLogical(int x, int y, const TInstrument& ins) const
 		int cells = std::max(1, env_len + 1);
 		int cell_w = std::max(8, grid_w / std::max(cells, 16));
 		if (cell_w > 24) cell_w = 24;
-		int grid_y = y0 + 26, cell_h = 18, row_pitch = cell_h + 2;
+		int grid_y = y0 + 32, cell_h = 18, row_pitch = cell_h + 2;
 		if (x >= grid_x && y >= grid_y) {
 			int c = (x - grid_x) / cell_w;
 			int row = (y - grid_y) / row_pitch;
@@ -1317,17 +1952,18 @@ Gui::EditHit Gui::EditFieldAtLogical(int x, int y, const TInstrument& ins) const
 		}
 	}
 
-	// --- Note table --- panel at (kMainX+8, kHeaderH+366, kMainW-16, 64)
+	// --- Note table ---
 	{
-		int x0 = kMainX + 2, y0 = kHeaderH + 366, w = kMainW - 4;
+		int x0 = kMainX + 2, y0 = kNoteTableY0, w = kMainW - 4;
 		int tbl_len = ins.parameters[PAR_TBL_LENGTH];
 		int label_w = 44;
 		int gx = x0 + 8 + label_w + 8;
 		int gw = w - 24 - label_w;
 		int cell_w = std::max(16, gw / 32);
 		if (cell_w > 24) cell_w = 24;
-		int gy = y0 + 24;
-		if (x >= gx && y >= gy && y < gy + 22) {
+		int gy = y0 + 30;  // must match DrawNoteTable
+		int cell_h_ht = std::max(20, 16 + 4);  // matches draw-time cell_h_note
+		if (x >= gx && y >= gy && y < gy + cell_h_ht) {
 			int i = (x - gx) / cell_w;
 			if (i >= 0 && i <= tbl_len) {
 				r.hit = true; r.panel = Editor::Panel::NoteTable; r.a = i; return r;
@@ -1349,10 +1985,26 @@ void Gui::DrawBank(SDL_Renderer* r, const GuiState& s)
 		: "Bank  (Ctrl+key plays the selected slot)");
 
 	// EDIT toggle button at the far right of the bank title row.
-	int ebx = g.panel_x + g.panel_w - 70, eby = g.panel_y + 2, ebw = 62, ebh = 16;
+	const int gh_b = GlyphH();
+	const int ebh = gh_b + 4;
+	int ebx = g.panel_x + g.panel_w - 70, eby = g.panel_y + 4, ebw = 62;
 	FillRect(r, s.bank_edit ? kBankCurrent : kPanelDark, ebx, eby, ebw, ebh);
 	OutlineRect(r, s.bank_edit ? kHighlight : kBorder, ebx, eby, ebw, ebh);
-	DrawText(r, s.bank_edit ? kBg : kTextDim, ebx + 14, eby + 4, "EDIT");
+	DrawText(r, s.bank_edit ? kBg : kTextDim, ebx + 14, eby + std::max(0, (ebh - gh_b) / 2), "EDIT");
+
+	// "Analyse" button immediately to the left of EDIT. Click runs
+	// App::AnalyseAllBankSlots to fingerprint every used slot in one go;
+	// results are cached on each Bank::Slot and persist through
+	// manifest.txt when the bank is saved.
+	const int abw = 78;
+	const int abx = ebx - 8 - abw;
+	FillRect(r, kPanelDark, abx, eby, abw, ebh);
+	OutlineRect(r, kBorder, abx, eby, abw, ebh);
+	{
+		const int label_w = (int)std::strlen("Analyse") * GlyphW();
+		DrawText(r, kText, abx + std::max(0, (abw - label_w) / 2),
+			eby + std::max(0, (ebh - gh_b) / 2), "Analyse");
+	}
 
 	if (!s.bank) return;
 
@@ -1393,41 +2045,114 @@ void Gui::DrawBank(SDL_Renderer* r, const GuiState& s)
 		if (sl.used && !sl.name.empty()) full += "-" + sl.name;
 
 		std::string line = Truncate(full, chars);
-		DrawText(r, kBg, cx + cell_pad + 4, cy + cell_pad + 4, line.c_str());
+		// Vertically centre text in the inner tile.
+		int inner_h = cell_h - 2 * cell_pad;
+		int txt_y = cy + cell_pad + std::max(0, (inner_h - GlyphH()) / 2);
+		DrawText(r, kBg, cx + cell_pad + 4, txt_y, line.c_str());
 	}
 }
 
 // ---------- Bank-slot right-click context menu ----------
 
 namespace {
-	struct BankMenuGeom { int x, y, w, h, item_h, items_top; };
-	constexpr int kBankMenuW = 152;
-	constexpr int kBankMenuItemH = 22;
-	constexpr int kBankMenuItems = 4;
-	constexpr int kBankMenuHeaderH = 20;   // slot title strip at the top
-	constexpr int kBankMenuBottomPad = 4;    // breathing room below the last item
+	struct BankMenuGeom {
+		int x, y, w, h, item_h, items_top;
+		// Cluster info area (only set when cluster_info is non-empty):
+		// info_top is the y-coord of the separator line above the text,
+		// info_lines lists the wrapped strings (so draw + hit-test agree).
+		int info_top = 0;
+		std::vector<std::string> info_lines;
+	};
+	constexpr int kBankMenuW         = 200;
+	constexpr int kBankMenuItemH     = 22;
+	constexpr int kBankMenuItems     = 5;     // New, Clear, Export, Import, Show cluster
+	constexpr int kBankMenuHeaderH   = 20;    // slot title strip at the top
+	constexpr int kBankMenuBottomPad = 4;     // breathing room below the last item
+	constexpr int kBankMenuInfoPad   = 4;     // breathing room around the info text
+	constexpr int kBankMenuInfoLineH = 11;    // 8 px font + 3 px gap
+	constexpr int kBankMenuInfoMaxChars = 22; // wrap width inside the menu
 
-	BankMenuGeom ComputeBankMenuGeom(int anchor_x, int anchor_y)
+	// Word-wrap `s` so each line is at most `max_chars`. Words longer than the
+	// max are hard-split. Returns at least one line for any non-empty input.
+	std::vector<std::string> WrapForBankMenu(const std::string& s, int max_chars)
 	{
-		int h = kBankMenuHeaderH + kBankMenuItemH * kBankMenuItems + kBankMenuBottomPad;
-		int x = anchor_x;
-		int y = anchor_y;
+		std::vector<std::string> lines;
+		if (max_chars <= 0 || s.empty()) return lines;
+		std::string cur;
+		size_t i = 0;
+		while (i < s.size()) {
+			while (i < s.size() && s[i] == ' ') ++i;
+			if (i >= s.size()) break;
+			size_t j = i;
+			while (j < s.size() && s[j] != ' ') ++j;
+			std::string word = s.substr(i, j - i);
+			while ((int)word.size() > max_chars) {
+				std::string head = word.substr(0, max_chars);
+				word = word.substr(max_chars);
+				if (!cur.empty()) { lines.push_back(cur); cur.clear(); }
+				lines.push_back(head);
+			}
+			if (cur.empty()) cur = word;
+			else if ((int)(cur.size() + 1 + word.size()) <= max_chars)
+				cur += " " + word;
+			else { lines.push_back(cur); cur = word; }
+			i = j;
+		}
+		if (!cur.empty()) lines.push_back(cur);
+		// Honour explicit '\n' in the source by re-wrapping every line that
+		// contains one (the caller can use \n to force a paragraph break).
+		std::vector<std::string> out;
+		for (const auto& ln : lines) {
+			size_t start = 0;
+			while (start <= ln.size()) {
+				size_t nl = ln.find('\n', start);
+				out.push_back(ln.substr(start,
+					(nl == std::string::npos ? ln.size() : nl) - start));
+				if (nl == std::string::npos) break;
+				start = nl + 1;
+			}
+		}
+		return out;
+	}
+
+	BankMenuGeom ComputeBankMenuGeom(int anchor_x, int anchor_y,
+		const std::string& cluster_info)
+	{
+		BankMenuGeom g;
+		g.w = kBankMenuW;
+		g.item_h = kBankMenuItemH;
+		int base = kBankMenuHeaderH + kBankMenuItemH * kBankMenuItems + kBankMenuBottomPad;
+		// The info area is always drawn (shows "None" when nothing has been
+		// analysed yet). An empty string from the caller is treated as
+		// "None" so the layout stays consistent across opens.
+		std::string body = cluster_info.empty() ? std::string("None") : cluster_info;
+		g.info_lines = WrapForBankMenu(body, kBankMenuInfoMaxChars);
+		if (g.info_lines.empty()) g.info_lines.push_back("None");
+		int info_h = kBankMenuInfoPad
+			+ (int)g.info_lines.size() * kBankMenuInfoLineH
+			+ kBankMenuInfoPad;
+		g.h = base + info_h;
+		g.x = anchor_x;
+		g.y = anchor_y;
 		// Keep the menu fully on-screen even when the click is near an edge.
-		if (x + kBankMenuW > kWinW) x = kWinW - kBankMenuW;
-		if (y + h > kWinH) y = kWinH - h;
-		if (x < 0) x = 0;
-		if (y < 0) y = 0;
-		return BankMenuGeom{ x, y, kBankMenuW, h, kBankMenuItemH, y + kBankMenuHeaderH };
+		if (g.x + g.w > kWinW) g.x = kWinW - g.w;
+		if (g.y + g.h > kWinH) g.y = kWinH - g.h;
+		if (g.x < 0) g.x = 0;
+		if (g.y < 0) g.y = 0;
+		g.items_top = g.y + kBankMenuHeaderH;
+		g.info_top  = g.items_top + kBankMenuItems * kBankMenuItemH + kBankMenuBottomPad;
+		return g;
 	}
 
 	const char* kBankMenuLabels[kBankMenuItems] = {
-		"New", "Clear", "Export RTI", "Import RTI",
+		"New", "Clear", "Export RTI", "Import RTI", "Analyse",
 	};
 } // namespace
 
 void Gui::DrawBankMenu(SDL_Renderer* r, const GuiState& s)
 {
-	BankMenuGeom g = ComputeBankMenuGeom(s.bank_menu_x, s.bank_menu_y);
+	BankMenuGeom g = ComputeBankMenuGeom(s.bank_menu_x, s.bank_menu_y,
+		s.bank_menu_cluster_info);
 
 	FillRect(r, kPanel, g.x, g.y, g.w, g.h);
 	OutlineRect(r, kBorder, g.x, g.y, g.w, g.h);
@@ -1435,13 +2160,14 @@ void Gui::DrawBankMenu(SDL_Renderer* r, const GuiState& s)
 	// Header strip identifying which slot the menu operates on.
 	char title[32];
 	std::snprintf(title, sizeof(title), "Slot %02d", s.bank_menu_slot);
-	DrawText(r, kTextDim, g.x + 8, g.y + 6, title);
+	DrawText(r, kTextDim, g.x + 8, g.y + std::max(2, (kBankMenuHeaderH - GlyphH()) / 2), title);
 	SetCol(r, kBorder);
-	SDL_RenderLine(r, (float)(g.x + 2), (float)(g.y + 18),
-		(float)(g.x + g.w - 2), (float)(g.y + 18));
+	SDL_RenderLine(r, (float)(g.x + 2), (float)(g.y + kBankMenuHeaderH - 2),
+		(float)(g.x + g.w - 2), (float)(g.y + kBankMenuHeaderH - 2));
 
-	// Clear and Export need an occupied slot; grey them out when empty so
-	// the user can see the option exists but isn't currently applicable.
+	// Clear, Export, and Show cluster need an occupied slot; grey them
+	// out when empty so the user can see the option exists but isn't
+	// currently applicable.
 	bool slot_used = s.bank && s.bank_menu_slot >= 0 &&
 		s.bank_menu_slot < Bank::SLOT_COUNT &&
 		s.bank->At(s.bank_menu_slot).used;
@@ -1456,24 +2182,38 @@ void Gui::DrawBankMenu(SDL_Renderer* r, const GuiState& s)
 
 	for (int i = 0; i < kBankMenuItems; ++i) {
 		int iy = g.items_top + i * g.item_h;
-		bool disabled = !slot_used && (i == 1 /*Clear*/ || i == 2 /*Export*/);
+		bool disabled = !slot_used &&
+			(i == 1 /*Clear*/ || i == 2 /*Export*/ || i == 4 /*Show cluster*/);
 		bool hovered = (i == hover);
 		if (hovered) {
-			// Subtle accent strip under the hovered row; leaves the menu
-			// border untouched at the very edges.
 			FillRect(r, kAccent, g.x + 1, iy, g.w - 2, g.item_h);
 		}
 		Col col;
-		if (disabled)     col = kBorder;          // dim = disabled
-		else if (hovered) col = kBg;              // dark text on the accent strip
+		if (disabled)     col = kBorder;
+		else if (hovered) col = kBg;
 		else              col = kText;
-		DrawText(r, col, g.x + 10, iy + (g.item_h - 8) / 2, kBankMenuLabels[i]);
+		DrawText(r, col, g.x + 10, iy + std::max(0, (g.item_h - GlyphH()) / 2), kBankMenuLabels[i]);
+	}
+
+	// Cluster-info section. Always drawn - "None" when the slot has never
+	// been analysed (or was modified since the last analysis). A horizontal
+	// divider sits just above it; lines are word-wrapped to fit the menu
+	// width. The text is not clickable - clicking anywhere here dismisses
+	// the menu like clicking outside.
+	SetCol(r, kBorder);
+	SDL_RenderLine(r, (float)(g.x + 6), (float)(g.info_top),
+		(float)(g.x + g.w - 6), (float)(g.info_top));
+	int ty = g.info_top + kBankMenuInfoPad;
+	for (const auto& ln : g.info_lines) {
+		DrawText(r, kHighlight, g.x + 10, ty, ln.c_str());
+		ty += kBankMenuInfoLineH;
 	}
 }
 
-Gui::BankMenuItem Gui::BankMenuItemAtLogical(int x, int y, int menu_x, int menu_y) const
+Gui::BankMenuItem Gui::BankMenuItemAtLogical(int x, int y, int menu_x, int menu_y,
+	const std::string& cluster_info) const
 {
-	BankMenuGeom g = ComputeBankMenuGeom(menu_x, menu_y);
+	BankMenuGeom g = ComputeBankMenuGeom(menu_x, menu_y, cluster_info);
 	if (x < g.x || x >= g.x + g.w) return BankMenuItem::None;
 	if (y < g.items_top) return BankMenuItem::None;
 	int idx = (y - g.items_top) / g.item_h;
@@ -1483,13 +2223,15 @@ Gui::BankMenuItem Gui::BankMenuItemAtLogical(int x, int y, int menu_x, int menu_
 		case 1: return BankMenuItem::Clear;
 		case 2: return BankMenuItem::Export;
 		case 3: return BankMenuItem::Import;
+		case 4: return BankMenuItem::Analyse;
 	}
 	return BankMenuItem::None;
 }
 
-bool Gui::PointInBankMenu(int x, int y, int menu_x, int menu_y) const
+bool Gui::PointInBankMenu(int x, int y, int menu_x, int menu_y,
+	const std::string& cluster_info) const
 {
-	BankMenuGeom g = ComputeBankMenuGeom(menu_x, menu_y);
+	BankMenuGeom g = ComputeBankMenuGeom(menu_x, menu_y, cluster_info);
 	return x >= g.x && x < g.x + g.w && y >= g.y && y < g.y + g.h;
 }
 
@@ -1577,7 +2319,7 @@ void Gui::DrawTreeMenu(SDL_Renderer* r, const GuiState& s)
 		bool hovered = (i == hover);
 		if (hovered) FillRect(r, kAccent, g.x + 1, iy, g.w - 2, g.item_h);
 		Col col = hovered ? kBg : kText;
-		DrawText(r, col, g.x + 10, iy + (g.item_h - 8) / 2,
+		DrawText(r, col, g.x + 10, iy + std::max(0, (g.item_h - GlyphH()) / 2),
 			TreeMenuLabel(i, has_ov));
 	}
 }
@@ -1633,7 +2375,7 @@ void Gui::DrawCategoryPicker(SDL_Renderer* r, const GuiState& s)
 		if (hovered)             col = kBg;
 		else if (i < nCat)       col = CategoryColour(i);
 		else                     col = kTextDim;
-		DrawText(r, col, g.x + 10, iy + (g.item_h - 8) / 2, label);
+		DrawText(r, col, g.x + 10, iy + std::max(0, (g.item_h - GlyphH()) / 2), label);
 	}
 }
 
@@ -1667,7 +2409,7 @@ namespace {
 	const HelpRow kHelpPage1[] = {
 		{ "Browsing & playback", "" },
 		{ "a .. z, 0 .. 9", "Play current instrument at chromatic pitches" },
-		{ "[  /  ]",        "Octave shift down / up" },
+		{ "[  /  ]",        "Octave shift down / up (or wheel over 'Oct:')" },
 		{ "Left / Right",   "Previous / next .RTI (hold to repeat)" },
 		{ "Up / Down",      "Previous / next .RTI (hold to repeat)" },
 		{ "Mouse wheel",    "Move selection quickly (3 at a time)" },
@@ -1677,29 +2419,50 @@ namespace {
 		{ "Enter",          "Toggle current file's folder (collapse/expand)" },
 		{ "Esc",            "Silence playback (or close this help)" },
 		{ "", "" },
+		{ "Tree views", "" },
+		{ "F8",             "Toggle Categories view (group by classified category)" },
+		{ "F9",             "Toggle 'Hide duplicates' (curated list vs full library)" },
+		{ "F10",            "Toggle Clusters view (group by audio similarity)" },
+		{ "Click view tab", "'Folders / Categories / Clusters / Show all / No dupes'" },
+		{ "",               "tabs at the top of the tree mirror the F8 / F9 / F10 keys" },
+		{ "", "" },
 		{ "Bank", "" },
 		{ "+  (or =)",      "Add current instrument to bank (dedupes by sound)" },
 		{ "-",              "Remove current instrument from bank" },
 		{ "Click / Tab",    "Select a bank slot (click filled slot loads it)" },
-		{ "Ctrl+arrows",    "Move the bank selection cursor" },
-		{ "Ctrl+a-z/0-9",   "Sample (play) the selected bank slot" },
+		{ "Ctrl+arrows",    "Move the bank cursor. Filled slots auto-load" },
+		{ "",               "(same as left-click). Empty slots step over without" },
+		{ "",               "touching what's currently loaded." },
+		{ "Ctrl+a-z/0-9",   "Sample (play) the selected bank slot (no load)" },
 		{ "Ctrl+Ins / Del", "Copy current into / delete selected slot (confirm)" },
-		{ "Right-click slot","Open the bank context menu (New/Clear/Export/Import)" },
+		{ "Right-click slot","Bank menu: New / Clear / Export / Import / Analyse" },
+		{ "Analyse button", "(bank title row, left of EDIT) Fingerprint every used" },
+		{ "",               "slot in one pass; results persist in the bank manifest." },
+		{ "Bank EDIT",      "Click the 'EDIT' button on the bank to flip into" },
+		{ "",               "EDIT mode. Ctrl+C / X / V / Y / S then operate on" },
+		{ "",               "the slot or instrument (Copy / Cut / Paste / Redo /" },
+		{ "",               "Save). Outside EDIT mode those keys fall through to" },
+		{ "",               "Ctrl+key audition so a stray Ctrl+S can't trigger a" },
+		{ "",               "Save when you meant to play the 'S' note." },
+		{ "",               "Ctrl+Z (Undo) stays available in both modes." },
 		{ "", "" },
-		{ "Editing  (F6 toggles Edit mode)", "" },
+		{ "Editing  (F6 toggles Edit mode - see page 6)", "" },
 		{ "Click a field",  "Jump the edit cursor onto that parameter / cell / name" },
 		{ "Right-click",    "Toggle a binary field (AUDCTL / type / filter)" },
 		{ "Tab / arrows",   "(edit) cycle panel / move cell cursor" },
 		{ "0-9 A-F",        "(edit) type a value; +/- or Shift+Up/Dn to nudge" },
 		{ "Ctrl+key",       "(edit) audition while editing; Space re-triggers" },
-		{ "Ctrl+Z / Ctrl+Y","Undo / redo" },
-		{ "Ctrl+S",         "Export the current instrument as a new .RTI" },
+		{ "Ctrl+Z",         "Undo (always available)" },
+		{ "Ctrl+Y",         "Redo (requires Bank EDIT - else plays 'Y' note)" },
+		{ "Ctrl+S",         "Export current instrument as a new .RTI" },
+		{ "",               "(requires Bank EDIT - else plays 'S' note)" },
 		{ "", "" },
 		{ "Files & display", "" },
 		{ "Drag & drop",    "Drop a folder or .RTI onto the window to load" },
-		{ "F1",             "Toggle this help (Left/Right = pages, Esc = close)" },
+		{ "F1",             "Toggle this help (Left/Right or wheel = pages, Esc close)" },
 		{ "F2 / F3 / F4",   "Save bank / Load bank / Switch library" },
 		{ "F5",             "Toggle PAL / NTSC" },
+		{ "F7",             "Re-analyse the library (see page 2)" },
 		{ "F11",            "Toggle fullscreen" },
 	};
 
@@ -1780,51 +2543,190 @@ namespace {
 		{ "",  "ascending  descending" },
 	};
 
-	// ----- Page 4: Clusters & spectral panel. -----
+	// ----- Page 4: Clusters (what / how / names / navigating). -----
 	const HelpRow kHelpPage4[] = {
 		{ "What clusters are for", "" },
 		{ "",  "Categories tell you WHAT KIND of instrument something is. Clusters" },
 		{ "",  "tell you WHICH OTHERS it sounds like - based on the rendered audio," },
 		{ "",  "not on parameters or filename. Two files in the same cluster share" },
-		{ "",  "an overall sonic character." },
+		{ "",  "an overall sonic character regardless of how they're named." },
 		{ "", "" },
 		{ "How clustering works", "" },
 		{ "",  "k-means runs over an 8-dimensional feature vector per file (RMS" },
 		{ "",  "profile + ZCR + peak position + centroid + rolloff + flux). The" },
-		{ "",  "values are standardised first so no single dimension dominates." },
-		{ "",  "k-means++ seeding makes the result deterministic." },
-		{ "",  "k = ceil(sqrt(N/2)) clamped to [3, 12] by default." },
+		{ "",  "values are standardised first (zero mean, unit variance per axis)" },
+		{ "",  "so no single dimension dominates. k-means++ seeding picks the" },
+		{ "",  "first centroid then each subsequent one as the point farthest from" },
+		{ "",  "any existing centroid - deterministic, no random restarts needed." },
 		{ "", "" },
-		{ "Switching to cluster view", "" },
+		{ "Cluster count  (k)", "" },
+		{ "",            "Default k = 24 (tuned for multi-thousand-file libraries)." },
+		{ "Ctrl+]  /  Ctrl+[",  "Step the cluster count for the next F7 (0 = auto)." },
+		{ "",                   "Auto uses ceil(sqrt(N/2)) clamped to [3, 12]." },
+		{ "",            "k is persisted in analysis.json so you don't have to" },
+		{ "",            "re-set it every launch; F7 re-analyses with the value" },
+		{ "",            "shown in the notice bar." },
+		{ "", "" },
+		{ "Cluster names", "" },
+		{ "",  "k-means produces unlabelled groups. PokeyForge appends a label:" },
+		{ "",  "    'Cluster 3 - Bass + Pad (dark, sustained) (24)'" },
+		{ "",  "  Bass + Pad   top-1 (and close top-2) member categories" },
+		{ "",  "  dark/...     up to 3 adjectives from the cluster's mean features" },
+		{ "",  "  24           how many instruments are in the cluster" },
+		{ "",  "The adjective vocabulary mirrors the per-file tags from page 2:" },
+		{ "",  "  bright / dark        spectral centroid > 4.5k / < 1.5k Hz" },
+		{ "",  "  loud / quiet         mean RMS > 0.20 / < 0.05" },
+		{ "",  "  percussive           short attack, near-silent tail" },
+		{ "",  "  sustained            flat RMS across the whole window" },
+		{ "",  "  animated             spectral flux > 0.40 (timbre motion)" },
+		{ "",  "  noisy                zero-crossing rate > 0.10" },
+		{ "", "" },
+		{ "Using the cluster view", "" },
 		{ "F10",         "Toggle Clusters view (or click the 'Clusters' tab)" },
-		{ "",            "Clusters are expanded by default - scroll straight through" },
-		{ "",            "and you'll hear how similar the adjacent rows are." },
+		{ "",            "Headers start collapsed so the whole cluster list is" },
+		{ "",            "visible at a glance. Click a header to expand or collapse" },
+		{ "",            "that one cluster. The cluster around the current selection" },
+		{ "",            "auto-expands so the highlighted row is never hidden." },
+		{ "Hover header","Tooltip shows the full label (long names get truncated" },
+		{ "",            "in the tree pane; the tooltip wraps to two lines)." },
 		{ "",            "Within each cluster, rows are sorted by spectral centroid" },
 		{ "",            "(brightness) ascending - dark sounds first, bright last." },
-		{ "Ctrl+]  /  Ctrl+[", "Step the k-means cluster count for the next F7" },
-		{ "",                  "(0 = automatic). The notice bar shows the active value." },
+	};
+
+	// ----- Page 5: Spectral signature panel. -----
+	const HelpRow kHelpPage5[] = {
+		{ "What the panel shows", "" },
+		{ "",  "An 8-bar bar chart of the currently-selected instrument's cached" },
+		{ "",  "audio features. Drawn at the bottom of the tree pane, just above" },
+		{ "",  "the search bar. Each bar's height is one feature normalised into" },
+		{ "",  "[0, 1] - it's a visual fingerprint of the sound." },
 		{ "", "" },
-		{ "Spectral signature panel", "" },
-		{ "",  "In Clusters view, a small bar chart appears at the bottom of the" },
-		{ "",  "tree above the search bar. Each of the 8 bars is one audio feature" },
-		{ "",  "of the currently-selected instrument, height = normalised value." },
-		{ "",  "Bars are tinted with the file's category colour, so the panel" },
-		{ "",  "doubles as a colour-coded confirmation of the row tint." },
-		{ "Bars (left -> right)", "" },
-		{ "",  "Atk / Mid / End  RMS profile (early / mid / late thirds)" },
-		{ "",  "ZCR  zero-crossing rate (noisiness)" },
-		{ "",  "Pk   peak-amplitude position (0 = attack, 1 = swell)" },
-		{ "",  "Cen  spectral centroid (brightness, Hz / 22050)" },
-		{ "",  "Rll  spectral 85% roll-off (Hz / 22050)" },
-		{ "",  "Flx  spectral flux (how much the timbre changes)" },
+		{ "When it's visible", "" },
+		{ "",  "Cluster view only (F10). The Folder and Category views hide it" },
+		{ "",  "because their grouping isn't by audio similarity, so the per-row" },
+		{ "",  "visualisation doesn't add anything there. The data comes from" },
+		{ "",  "analysis.json - if you haven't run F7, or the cache is from a" },
+		{ "",  "parametric-only build, all bars sit at zero." },
+		{ "", "" },
+		{ "The eight bars  (left -> right)", "" },
+		{ "Atk",  "rms_early - RMS over the first 1/3 of the rendered window" },
+		{ "Mid",  "rms_mid   - RMS over the middle 1/3" },
+		{ "End",  "rms_late  - RMS over the last 1/3" },
+		{ "ZCR",  "zero-crossing rate (0..1). High = noisy / high-frequency content" },
+		{ "Pk",   "position of the absolute-peak sample within the window" },
+		{ "",     "(0 = attack, 0.5 = mid, 1 = swell at the end)" },
+		{ "Cen",  "spectral centroid in Hz, divided by 22050 for the [0,1] axis" },
+		{ "",     "(perceived brightness - higher bar = brighter sound)" },
+		{ "Rll",  "spectral 85% roll-off in Hz, also normalised by 22050" },
+		{ "",     "(where most of the energy stops - tracks bandwidth)" },
+		{ "Flx",  "average frame-to-frame spectral change" },
+		{ "",     "(0 = static timbre, higher = timbre keeps shifting)" },
+		{ "", "" },
+		{ "Reading the shape  (typical signatures)", "" },
+		{ "Kick",  "Atk tall, Mid/End decay sharply, Pk near 0, Flx high" },
+		{ "Hi-hat","Atk tall, Mid/End near zero, ZCR very high, Cen high" },
+		{ "Pad",   "Atk/Mid/End roughly equal (flat), Flx low" },
+		{ "Bass",  "Cen + Rll low, RMS profile moderate and steady" },
+		{ "Sweep", "Flx high (timbre moves), Atk/Mid/End similar height" },
+		{ "Bell",  "Cen high, ZCR moderate, peak position centred" },
+		{ "", "" },
+		{ "Colour and category cross-check", "" },
+		{ "",  "The bars are tinted with the file's category colour, matching the" },
+		{ "",  "row tint in the tree. If a row looks misclassified (e.g. tinted" },
+		{ "",  "as Pad but with a tall Atk and fast decay), the bar shape will" },
+		{ "",  "make the disagreement visible. Right-click -> Override category" },
+		{ "",  "to correct it (page 2 covers manual overrides)." },
+	};
+
+	// ----- Page 6: Editing instruments in place. -----
+	const HelpRow kHelpPage6[] = {
+		{ "Edit mode  (F6 to enter / leave)", "" },
+		{ "",  "PokeyForge ships an in-place editor: F6 turns Browse into Edit." },
+		{ "",  "The focused panel grows a white frame, a red cell cursor appears" },
+		{ "",  "inside it, and the instrument header shows the edited fields'" },
+		{ "",  "current value + valid range under the panel name. An orange dot" },
+		{ "",  "next to the filename means there are unsaved changes." },
+		{ "", "" },
+		{ "The four editable panels", "" },
+		{ "Name",       "Instrument name text. Type characters; Backspace / Delete" },
+		{ "",           "edit; arrows move the insertion point. Max 32 chars." },
+		{ "Parameters", "Top numeric panel - envelope length, table length, fade," },
+		{ "",           "vibrato, AUDCTL flags, etc. Two-digit hex fields compose" },
+		{ "",           "as you type (first nibble shifts left, second fills low)." },
+		{ "Envelope",   "16-column / 6-row grid: Volume L, Volume R (stereo)," },
+		{ "",           "Distortion, Audctl mods, Filter / Portamento flags, and" },
+		{ "",           "envelope command. Columns 0..PAR_ENV_LENGTH are active;" },
+		{ "",           "PAR_ENV_GOTO sets the loop point (column with the marker)." },
+		{ "Note table", "Per-step note offsets used by arps / chords / glides." },
+		{ "",           "Length is PAR_TBL_LENGTH (page 2 explains arp vs chord)." },
+		{ "", "" },
+		{ "Moving the cursor", "" },
+		{ "Tab / Shift+Tab", "Cycle through panels (Name -> Params -> Env -> Tbl)" },
+		{ "Arrow keys",      "Move within the current panel (rows / columns / cells)" },
+		{ "Click",           "Jump cursor straight to the clicked field (any panel)" },
+		{ "Esc",             "Exit Edit mode (equivalent to F6)" },
+		{ "", "" },
+		{ "Changing values", "" },
+		{ "0-9 A-F",         "Type a hex digit. Two-digit fields compose: first" },
+		{ "",                "press is the high nibble, second is the low. After" },
+		{ "",                "moving the cursor the next digit overwrites instead." },
+		{ "+ / -",           "Increment / decrement the current cell (+/- 1)" },
+		{ "Shift+Up / Down", "Same as +/- (faster on the keyboard)" },
+		{ "Mouse wheel",     "Nudge the focused field by +/- 1 (anywhere outside" },
+		{ "",                "the directory pane)" },
+		{ "Right-click",     "Toggle a binary field (AUDCTL flags, Filter row," },
+		{ "",                "Portamento flag, table type, table mode)" },
+		{ "", "" },
+		{ "Mono vs Stereo (Envelope panel header toggle)", "" },
+		{ "",                "Loaded instruments default to MONO regardless of how" },
+		{ "",                "they're encoded on disk. The 'Mono' / 'Stereo' button" },
+		{ "",                "in the Envelope header (and in the big Vol popup's" },
+		{ "",                "top-right) flips the working instrument's encoding." },
+		{ "",                "In MONO any change to a VolL cell mirrors to VolR" },
+		{ "",                "and vice versa - across hex digits, +/- nudges," },
+		{ "",                "scroll-wheel, drag-paint, and the vol popup. The two" },
+		{ "",                "channels stay locked until you flip to stereo." },
+		{ "",                "In STEREO the channels are independent; the popup's" },
+		{ "",                "up / down arrows between sections copy one row over" },
+		{ "",                "the other in one undoable op." },
+		{ "", "" },
+		{ "Audition while editing", "" },
+		{ "Ctrl + a-z / 0-9", "Play a note WITHOUT leaving the cell cursor. The" },
+		{ "",                 "modifier prevents the key from being interpreted as" },
+		{ "",                 "a hex digit, so you can listen between edits." },
+		{ "Space",            "Re-trigger the last note (same pitch, latest changes)" },
+		{ "", "" },
+		{ "Undo, save, export", "" },
+		{ "Ctrl+Z",           "Undo. Always available - the undo stack survives" },
+		{ "",                 "across panel switches and resets when you load a" },
+		{ "",                 "different instrument." },
+		{ "Ctrl+Y",           "Redo. Bank EDIT mode required (page 1) - outside" },
+		{ "",                 "EDIT mode Ctrl+Y plays the 'Y' note as audition." },
+		{ "Ctrl+S",           "Export the working copy as a new .RTI file." },
+		{ "",                 "Same gate as Ctrl+Y: Bank EDIT must be on, so the" },
+		{ "",                 "Save can't fire when you meant to audition 'S'." },
+		{ "",                 "The Save dialog defaults to the current library" },
+		{ "",                 "folder; the on-disk source file is never over-" },
+		{ "",                 "written - every Ctrl+S is 'Save As' to keep" },
+		{ "",                 "modifications auditable." },
+		{ "", "" },
+		{ "Visual cues", "" },
+		{ "Orange dot",       "Unsaved changes on the working copy" },
+		{ "White panel frame","The panel that has cell focus" },
+		{ "Red cell box",     "Cell currently under the cursor" },
+		{ "Header subline",   "<panel> <field name>: <value> [range]   <doc string>" },
 	};
 
 	const HelpPage kHelpPages[] = {
 		{ "Keybindings",            kHelpPage1, (int)(sizeof(kHelpPage1) / sizeof(kHelpPage1[0])) },
 		{ "Categories & analysis",  kHelpPage2, (int)(sizeof(kHelpPage2) / sizeof(kHelpPage2[0])) },
 		{ "Search syntax",          kHelpPage3, (int)(sizeof(kHelpPage3) / sizeof(kHelpPage3[0])) },
-		{ "Clusters & spectral view", kHelpPage4, (int)(sizeof(kHelpPage4) / sizeof(kHelpPage4[0])) },
+		{ "Clusters",               kHelpPage4, (int)(sizeof(kHelpPage4) / sizeof(kHelpPage4[0])) },
+		{ "Spectral signature panel", kHelpPage5, (int)(sizeof(kHelpPage5) / sizeof(kHelpPage5[0])) },
+		{ "Editor",                 kHelpPage6, (int)(sizeof(kHelpPage6) / sizeof(kHelpPage6[0])) },
 	};
+	static_assert((int)(sizeof(kHelpPages) / sizeof(kHelpPages[0])) == Gui::kHelpPageCount,
+	              "kHelpPageCount in Gui.h must match the number of kHelpPages entries");
 
 } // namespace
 
@@ -1922,7 +2824,7 @@ void Gui::DrawHelpOverlay(SDL_Renderer* r, const GuiState& s)
 	SDL_RenderLine(r, (float)(g.x + 20), (float)(g.footer_y - 6),
 		(float)(g.content_right), (float)(g.footer_y - 6));
 	DrawText(r, kTextDim, g.x + 20, g.footer_y,
-		"Left / Right  page    Esc / F1  close    click outside  dismiss");
+		"Left / Right or wheel  page    Esc / F1  close    click outside  dismiss");
 
 	// Clickable Prev / Next buttons. Hover highlight matches the rest of
 	// the modal popups (kAccent fill + kBg text on hover).

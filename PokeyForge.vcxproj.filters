@@ -1,26 +1,56 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
-    <ClCompile Include="src\Analysis.cpp" />
-    <ClCompile Include="src\Atari.cpp" />
-    <ClCompile Include="src\Audio.cpp" />
-    <ClCompile Include="src\Bank.cpp" />
-    <ClCompile Include="src\C6502.cpp" />
-    <ClCompile Include="src\Config.cpp" />
-    <ClCompile Include="src\Directory.cpp" />
-    <ClCompile Include="src\DriverBinaries.cpp" />
-    <ClCompile Include="src\Editor.cpp" />
-    <ClCompile Include="src\Gui.cpp" />
-    <ClCompile Include="src\Keyboard.cpp" />
-    <ClCompile Include="src\main.cpp" />
-    <ClCompile Include="src\Pokey.cpp" />
-    <ClCompile Include="src\RmtEngine.cpp" />
-    <ClCompile Include="src\RtiFile.cpp" />
+    <ClCompile Include="src\Analysis.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Atari.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Audio.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Bank.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\C6502.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Config.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Directory.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\DriverBinaries.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Editor.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Gui.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Keyboard.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\main.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Pokey.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\RmtEngine.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\RtiFile.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
+    <ClCompile Include="src\TextRenderer.cpp">
+      <Filter>Source</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="src\InstrumentTypes.h" />
-    <ClInclude Include="src\Keyboard.h" />
-    <ClInclude Include="src\RmtAddresses.h" />
     <ClInclude Include="src\Analysis.h">
       <Filter>Headers</Filter>
     </ClInclude>
@@ -69,6 +99,15 @@
     <ClInclude Include="src\Version.h">
       <Filter>Headers</Filter>
     </ClInclude>
+    <ClInclude Include="src\InstrumentTypes.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Keyboard.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\RmtAddresses.h">
+      <Filter>Headers</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="app.rc" />
@@ -79,6 +118,9 @@
     </Filter>
     <Filter Include="Docs">
       <UniqueIdentifier>{7810b31c-8a6c-4555-b228-b0d3edac72a5}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source">
+      <UniqueIdentifier>{4c5f1899-ed3b-4943-9fdb-f4f3bf463ca4}</UniqueIdentifier>
     </Filter>
   </ItemGroup>
   <ItemGroup>

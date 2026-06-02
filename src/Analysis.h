@@ -61,12 +61,19 @@ namespace Analysis {
 //        every Generate call returned 0x80-silence regardless of how
 //        we re-routed it (main vs audio thread, big vs small calls,
 //        with/without Silence). The classifier falls back to the v2
-//        parametric-only decision tree (categories + confidence + tags
-//        derived from parameters); audio-derived sub-tags (bright /
-//        dark / loud / quiet / animated) and k-means clustering are
-//        disabled. Existing v5 caches with stale all-zero features
-//        get auto-regenerated.
-constexpr int kAnalysisVersion = 6;
+//        parametric-only decision tree.
+//   v7 - audio features re-enabled via the new IATAudioTap path. The
+//        patched sa_pokey.dll exposes Pokey_SetAudioTap which captures
+//        raw POKEY float samples at ~64 kHz directly from the engine's
+//        internal mixer (the Pokey_Process buffer is still memset to
+//        silence by design - that's the bug the v6 path tripped on).
+//        Features are rendered single-pitch (note 24); spectral
+//        centroid / rolloff are computed at the engine's native mix
+//        rate, not 44.1 kHz; k-means clustering and bright / dark /
+//        loud / quiet / animated tags are back. Falls back to v6
+//        behaviour (parametric only) when the loaded DLL is the
+//        original sa_pokey without the analysis ABI exports.
+constexpr int kAnalysisVersion = 7;
 
 // Expanded category set (v2). The first-match-wins decision tree in
 // Classify() walks these top-down; an instrument lands in exactly one.
@@ -141,11 +148,28 @@ struct Features {
     float  flux      = 0;   // mean per-frame spectral change (timbre motion)
 };
 
-// Audio feature extraction is currently a no-op (see kAnalysisVersion v6
-// note above). The signature is preserved for callers; the returned
-// Features always has valid == false so Classify falls back to its
-// parametric-only path.
+// Render the instrument through the live engine, capture POKEY samples
+// through the audio tap, and compute spectral/temporal features. Returns
+// Features{} (valid=false) when the loaded sa_pokey.dll lacks the
+// analysis ABI exports - in that case Classify falls back to parametric
+// signals only.
+//
+// The caller is expected to have muted the engine's native audio output
+// (Pokey::SetMute(true)) for the duration of the analysis pass so the
+// user doesn't hear every instrument briefly play.
+//
+// This variant assumes the tap is already installed by Analysis::Run
+// (which loops over every file). For one-off renders outside that loop
+// use ExtractFeaturesOneShot below.
 Features ExtractFeatures(RmtEngine& engine, const std::vector<byte>& ata);
+
+// One-shot variant for callers outside Analysis::Run. Installs the
+// internal feature-capture tap, runs ExtractFeatures, uninstalls the tap.
+// Caller is expected to have paused any other audio path (e.g.
+// PokeyForge's SDL stream) so the tap isn't competing for the engine.
+// Used by the bank-slot "Show cluster" menu to fingerprint a single
+// instrument on demand.
+Features ExtractFeaturesOneShot(RmtEngine& engine, const std::vector<byte>& ata);
 
 // Coarse classification from the decoded instrument's parameters/envelope
 // (plus, when available, the rendered-audio Features). The decision tree
@@ -168,12 +192,20 @@ struct Summary {
 // pump SDL events / redraw inside the callback.
 using ProgressFn = void(*)(int current, int total, void* userdata);
 
+// Default for `Options::k_override`: tuned for multi-thousand-instrument
+// libraries where the auto formula's 3..12 cap produces too few groups
+// to be useful. Used by both the GUI's initial App::k_clusters_override
+// and the headless `--analyse` path so a fresh install ships with the
+// same cluster behaviour either way. The user can step it via
+// Ctrl+] / Ctrl+[ and the new value is persisted in analysis.json.
+constexpr int kDefaultKOverride = 24;
+
 // Override for k-means cluster count. `k_override > 0` uses that value
-// directly; otherwise k is chosen automatically as
-// ceil(sqrt(N/2)) clamped to [3, 12].
+// directly; `k_override == 0` falls back to the auto formula
+// (ceil(sqrt(N/2)) clamped to [3, 12]).
 struct Options {
     RmtEngine*  engine     = nullptr;
-    int         k_override = 0;
+    int         k_override = kDefaultKOverride;
     ProgressFn  progress   = nullptr;
     void*       progress_ud = nullptr;
 };
@@ -189,6 +221,13 @@ Summary Run(Directory& dir, const std::string& libraryRoot, bool writeJson,
 
 // Load analysis.json from `libraryRoot` and apply it to `dir` (matching by
 // path). Returns true if a usable file was found and applied.
-bool LoadAndApply(Directory& dir, const std::string& libraryRoot);
+//
+// If `out_k_override` is non-null and the file carries a "k_override"
+// field, the saved value is written there so the caller can restore its
+// per-library k-means override. The field is absent in pre-v8 caches and
+// in caches written before the field was introduced - `*out_k_override`
+// is left as -1 in that case so the caller can fall back to its default.
+bool LoadAndApply(Directory& dir, const std::string& libraryRoot,
+                  int* out_k_override = nullptr);
 
 } // namespace Analysis

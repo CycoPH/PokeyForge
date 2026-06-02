@@ -4,6 +4,7 @@
 #include "Types.h"
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -41,6 +42,14 @@ public:
         std::string name;
         int         version = 1;
         std::vector<byte> ata;
+        // Cached cluster fingerprint set by App::AnalyseAllBankSlots /
+        // App::FindClusterForBankSlot. cluster_hash is the FNV-1a of `ata`
+        // at the moment cluster_info was computed - so a later edit /
+        // import / paste auto-invalidates the cache (HashAta(ata) won't
+        // match cluster_hash anymore). Empty cluster_info means "never
+        // analysed" and renders as "None" in the bank menu.
+        std::string   cluster_info;
+        std::uint64_t cluster_hash = 0;
     };
 
     Bank();
@@ -79,6 +88,13 @@ public:
     const Slot& At(int slot) const { return m_slots[slot]; }
     int         UsedCount()  const;
     bool        IsFull()     const;
+
+    // Set the cached cluster fingerprint on a slot. `info` is the multi-line
+    // string displayed in the bank's right-click menu; `hash` is the FNV-1a
+    // of the slot's current ATA (so we can detect a stale cache when the
+    // slot is mutated later). Empty `info` clears the cache.
+    void        SetClusterInfo(int slot, const std::string& info,
+                               std::uint64_t hash);
 
     // Write all non-empty slots to outdir as `NN_name.rti` + manifest.txt.
     // Creates outdir if needed. Returns the number of files written, or

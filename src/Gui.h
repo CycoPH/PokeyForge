@@ -10,6 +10,9 @@
 
 #include <string>
 
+// Forward declaration so Gui.h does not drag in SDL3_ttf headers.
+struct TextRenderer;
+
 // Read-only renderer for PokeyForge's main screen. Render() takes a
 // snapshot-style GuiState (built fresh per frame from the App) and draws:
 //   - Directory tree (left column) + view tabs + scrollbar + search bar
@@ -63,6 +66,11 @@ struct GuiState {
     int   bank_menu_slot = -1;       // target slot for the menu actions
     int   bank_menu_x    = 0;        // anchor (top-left) in logical coords
     int   bank_menu_y    = 0;
+    // Cluster info to display at the bottom of the menu, populated when
+    // the user clicks "Show cluster". Empty string = no info section drawn.
+    // Multi-line strings are word-wrapped to the menu width by the
+    // renderer (multiple lines extend the menu downward).
+    std::string bank_menu_cluster_info;
 
     // Right-click context menu on a directory tree file row.
     bool  tree_menu_open = false;
@@ -79,10 +87,18 @@ struct GuiState {
     int   cat_picker_x    = 0;
     int   cat_picker_y    = 0;
 
+    // Mono/stereo mode for the current instrument's volume rows.
+    // Mono: VolR mirrors VolL; stereo: independent channels.
+    bool  instr_stereo   = false;
+
     // Latest mouse position in logical coords; -1 means off-screen/unknown.
     // Used by DrawBankMenu to draw a hover highlight under the cursor.
     int   mouse_x        = -1;
     int   mouse_y        = -1;
+
+    // Undo / Redo stack depths (for greying out buttons).
+    int   undo_depth     = 0;
+    int   redo_depth     = 0;
 
     // Live POKEY shadow registers ($D200..$D208) for the master scope.
     byte  pokey[9] = {0};
@@ -91,9 +107,12 @@ struct GuiState {
 class Gui {
 public:
     // Number of pages in the F1 help overlay (Keybindings, Categories &
-    // analysis, Search syntax, Clusters & spectral view). Exposed so the
-    // event loop can wrap Left/Right page navigation.
-    static constexpr int kHelpPageCount = 4;
+    // analysis, Search syntax, Clusters, Spectral panel, Editor). Exposed
+    // so the event loop can wrap Left/Right page navigation.
+    static constexpr int kHelpPageCount = 6;
+
+    // Attach a TextRenderer (must outlive this Gui).  Call before Render().
+    void SetTextRenderer(TextRenderer* tr) { m_text_renderer = tr; }
 
     // Help overlay hit-tests: which page button (if any) lies under (x,y)?
     // Returns -1 for the "Prev" arrow, +1 for "Next", 0 for neither.
@@ -147,6 +166,11 @@ public:
     // True if (x,y) is inside the bank EDIT toggle button.
     bool PointInBankEdit(int x, int y) const;
 
+    // True if (x,y) is inside the "Analyse" button on the bank title row
+    // (left of the EDIT toggle). Click runs App::AnalyseAllBankSlots so
+    // every used slot's cluster fingerprint is updated in one pass.
+    bool PointInBankAnalyse(int x, int y) const;
+
     // Returns 'k'/'d'/'c' for the unsaved-edits prompt button under (x,y), or 0.
     char SavePromptButtonAt(int x, int y) const;
 
@@ -160,9 +184,15 @@ public:
     // Bank-slot right-click context menu. The menu anchor (top-left in
     // logical coords) is passed in directly so the hit-test can run from
     // the event loop without needing a full GuiState.
-    enum class BankMenuItem { None, New, Clear, Export, Import };
-    BankMenuItem BankMenuItemAtLogical(int x, int y, int menu_x, int menu_y) const;
-    bool         PointInBankMenu      (int x, int y, int menu_x, int menu_y) const;
+    enum class BankMenuItem { None, New, Clear, Export, Import, Analyse };
+    // The bank menu hit-tests vary in height when `cluster_info` is non-empty
+    // (the menu grows downwards to display the rendered cluster name + audio
+    // descriptor). Pass the same info string both to draw and hit-test so
+    // they agree on the layout. Empty string = no info area drawn.
+    BankMenuItem BankMenuItemAtLogical(int x, int y, int menu_x, int menu_y,
+                                       const std::string& cluster_info) const;
+    bool         PointInBankMenu      (int x, int y, int menu_x, int menu_y,
+                                       const std::string& cluster_info) const;
 
     // Directory-tree right-click context menu. Same shape as the bank
     // menu (anchor passed in, hit-test usable from the event loop). The
@@ -200,6 +230,42 @@ public:
     };
     EditHit EditFieldAtLogical(int x, int y, const TInstrument& ins) const;
 
+    // Hit-test the Undo / Redo / Revert buttons in the instrument header.
+    // Returns 'u' = Undo, 'r' = Redo, 'v' = Revert, or 0.
+    char InstrHeaderButtonAt(int x, int y) const;
+
+    // Mono/stereo toggle button in the envelope section header.
+    // Returns true when (x,y) is inside the button.
+    bool PointInStereoToggle(int x, int y) const;
+
+    // Volume popup: a large floating bar-graph editor for VolR and VolL rows.
+    // The popup opens when the user clicks the mini vol-graph in the envelope
+    // header strip, and closes on ESC or click-outside.
+    bool PointInVolGraph(int x, int y) const;
+    bool VolPopupOpen()  const { return m_vol_popup_open; }
+    void OpenVolPopup()        { m_vol_popup_open = true; }
+    void CloseVolPopup()       { m_vol_popup_open = false; }
+    bool PointInVolPopup(int x, int y) const;
+
+    // Result of VolPopupCellAt(): the envelope row index (VOLUMER / VOLUMEL),
+    // the column, and the value (0-15) inferred from the mouse Y position.
+    struct VolPopupHit { bool hit = false; int row = 0; int col = 0; int value = 0; };
+    VolPopupHit VolPopupCellAt(int x, int y, const TInstrument& ins, bool stereo) const;
+
+    // Goto-handle drag: the strip at the bottom of the vol popup lets the user
+    // drag the PAR_ENV_GOTO marker left or right.
+    bool PointInVolGotoHandle(int x, int y, const TInstrument& ins) const;
+    int  VolGotoColAt(int x, const TInstrument& ins) const;
+    bool VolGotoDragging() const { return m_vol_goto_drag; }
+    void BeginVolGotoDrag()      { m_vol_goto_drag = true; }
+    void EndVolGotoDrag()        { m_vol_goto_drag = false; }
+
+    // Returns 'L' (copy VolL→VolR), 'R' (copy VolR→VolL), or 0 (no hit).
+    char VolCopyButtonAt(int x, int y) const;
+
+    // True when (x,y) is over the Mono/Stereo toggle button inside the vol popup.
+    bool PointInVolPopupStereoToggle(int x, int y) const;
+
 private:
     void DrawHeader(SDL_Renderer* r, const GuiState& s);
     void DrawTree  (SDL_Renderer* r, const GuiState& s);
@@ -219,6 +285,7 @@ private:
     void DrawBankMenu(SDL_Renderer* r, const GuiState& s);
     void DrawTreeMenu(SDL_Renderer* r, const GuiState& s);
     void DrawCategoryPicker(SDL_Renderer* r, const GuiState& s);
+    void DrawVolPopup(SDL_Renderer* r, const GuiState& s);
 
     // Tree geometry captured during DrawTree for click hit-testing.
     int m_tree_top = 0;
@@ -243,4 +310,11 @@ private:
     // selected node actually changes, leaving manual scrolling alone.
     int  m_last_cur_node = -2;
     bool m_user_scrolled = false;
+
+    // Volume bar-graph popup state.
+    bool m_vol_popup_open = false;
+    bool m_vol_goto_drag  = false;
+
+    // Optional TTF text renderer; nullptr = use debug font fallback.
+    TextRenderer* m_text_renderer = nullptr;
 };

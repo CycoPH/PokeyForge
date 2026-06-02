@@ -30,6 +30,15 @@ banks/
 # canonical zips). Comment this out if you want to commit a tagged build.
 dist/
 
+# ---- extras/sa_pokey-src build outputs -----------------------------
+# Vendored AltirraSDL builds drop intermediate .lib/.obj files and the
+# final .dll into out/, lib/, obj/ next to src/. The produced DLL is
+# auto-installed into runtime/, which is the only artifact we want
+# tracked (and runtime/ is .gitignore-exempt above).
+extras/sa_pokey-src/out/
+extras/sa_pokey-src/lib/
+extras/sa_pokey-src/obj/
+
 # ---- Visual Studio per-user state ----------------------------------
 .vs/
 *.suo

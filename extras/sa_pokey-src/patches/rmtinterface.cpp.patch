@@ -1,0 +1,108 @@
+diff --git a/src/AltirraRMTPOKEY/source/rmtinterface.cpp b/src/AltirraRMTPOKEY/source/rmtinterface.cpp
+index 4bf3883..c5015d8 100644
+--- a/src/AltirraRMTPOKEY/source/rmtinterface.cpp
++++ b/src/AltirraRMTPOKEY/source/rmtinterface.cpp
+@@ -28,6 +28,26 @@
+ #include <windows.h>
+ #include "rmtbypass.h"
+ 
++// Extension for PokeyForge: C-callable audio tap signature. The tap fires
++// with raw POKEY mix-rate float samples (~63920 Hz NTSC / 63337 Hz PAL),
++// mono in left[] when right is null, otherwise interleaved-by-channel.
++typedef void (__cdecl *ATRMTPokeyAudioTapFn)(const float *left, const float *right, uint32 count, uint32 timestamp, void *user);
++
++class ATRMTPokeyAudioTapAdapter final : public IATAudioTap {
++public:
++	void Set(ATRMTPokeyAudioTapFn fn, void *user) { mFn = fn; mUser = user; }
++	bool Active() const { return mFn != nullptr; }
++
++	void WriteRawAudio(const float *left, const float *right, uint32 count, uint32 timestamp) override {
++		if (mFn)
++			mFn(left, right, count, timestamp, mUser);
++	}
++
++private:
++	ATRMTPokeyAudioTapFn mFn = nullptr;
++	void *mUser = nullptr;
++};
++
+ class ATRMTPokeyContext final : public IATRMTBypassLink, public IATPokeyEmulatorConnections, public IATSchedulerCallback {
+ public:
+ 	ATRMTPokeyContext();
+@@ -53,6 +73,10 @@ public:
+ 
+ 	void OnScheduledEvent(uint32 id) override;
+ 
++	// PokeyForge extensions.
++	void SetAudioTap(ATRMTPokeyAudioTapFn fn, void *user);
++	void SetMute(bool mute);
++
+ private:
+ 	void LinkAdvanceTo(uint32 t);
+ 
+@@ -73,6 +97,8 @@ private:
+ 	uint8 mRMTShadowRegs[0x20] {};
+ 	sint32 mMuteCounters[2][4] {};
+ 
++	ATRMTPokeyAudioTapAdapter mTapAdapter;
++
+ 	ATScheduler mScheduler;
+ 	ATPokeyTables mPokeyTables;
+ };
+@@ -237,6 +263,17 @@ bool ATRMTPokeyContext::PokeyIsKeyPushOK(uint8 scanCode, bool cooldownExpired) c
+ 	return true;
+ }
+ 
++void ATRMTPokeyContext::SetAudioTap(ATRMTPokeyAudioTapFn fn, void *user) {
++	mTapAdapter.Set(fn, user);
++	if (mpAudioOutput)
++		mpAudioOutput->SetAudioTap(mTapAdapter.Active() ? &mTapAdapter : nullptr);
++}
++
++void ATRMTPokeyContext::SetMute(bool mute) {
++	if (mpAudioOutput)
++		mpAudioOutput->SetMute(mute);
++}
++
+ void ATRMTPokeyContext::OnScheduledEvent(uint32 id) {
+ 	mpEventEOF = mScheduler.AddEvent(114 * 262, this, 1);
+ 
+@@ -342,3 +379,38 @@ extern "C" void __declspec(dllexport) __cdecl Pokey_About(char **name, char **au
+ extern "C" __declspec(dllexport) IATRMTBypassLink * __cdecl AltirraRMT_LinkFromCPU() {
+ 	return g_pATRMTPokeyContext;
+ }
++
++// ---- PokeyForge extensions ------------------------------------------------
++// Capture raw POKEY samples for offline analysis. These exports are *not*
++// part of the RMT plugin contract -- they are additions used by PokeyForge
++// (https://github.com/CycoPH/PokeyForge) to feed audio-feature extraction
++// without going through a native audio device.
++//
++// Usage from the host:
++//   Pokey_SetMute(1);                                   // silence speakers
++//   Pokey_SetAudioTap(MyCallback, myUserPtr);           // start capturing
++//   while (need_more_samples)
++//       Pokey_Process(throwaway, N);                    // run engine
++//   Pokey_SetAudioTap(nullptr, nullptr);                // stop capturing
++//   Pokey_SetMute(0);
++//
++// The callback is invoked synchronously from within Pokey_Process (or the
++// sa_c6502 link path) at the engine's native mix rate (~63920 Hz NTSC,
++// 63337 Hz PAL). `right` is null in mono.
++
++extern "C" int __declspec(dllexport) __cdecl Pokey_GetAnalysisAbiVersion() {
++	// Encoded as (major << 16) | minor so the function body is distinct from
++	// DllMain (return TRUE) and identical-COMDAT-folding can't merge them.
++	// v1.0: Pokey_SetAudioTap + Pokey_SetMute + Pokey_GetAnalysisAbiVersion.
++	return 0x00010000;
++}
++
++extern "C" void __declspec(dllexport) __cdecl Pokey_SetAudioTap(ATRMTPokeyAudioTapFn fn, void *user) {
++	if (g_pATRMTPokeyContext)
++		g_pATRMTPokeyContext->SetAudioTap(fn, user);
++}
++
++extern "C" void __declspec(dllexport) __cdecl Pokey_SetMute(int mute) {
++	if (g_pATRMTPokeyContext)
++		g_pATRMTPokeyContext->SetMute(mute != 0);
++}

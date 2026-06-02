@@ -55,7 +55,15 @@ if (Test-Path $stage) {
 }
 New-Item -ItemType Directory -Force $stage | Out-Null
 
-$runtime = @('PokeyForge.exe','SDL3.dll','sa_pokey.dll','sa_c6502.dll','rmt_driver_v2.obx')
+$runtime = @(
+    'PokeyForge.exe',
+    'SDL3.dll',
+    'SDL3_ttf.dll',
+    'sa_pokey.dll',
+    'sa_c6502.dll',
+    'rmt_driver_v2.obx',
+    'JetBrainsMono-Regular.ttf'
+)
 foreach ($f in $runtime) {
     $src = Join-Path $out $f
     if (-not (Test-Path $src)) { throw "Missing build output: $src" }

@@ -1,7 +1,10 @@
 #include "Directory.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
+#include <unordered_map>
 
 namespace fs = std::filesystem;
 
@@ -112,14 +115,13 @@ void Directory::SetViewMode(ViewMode m)
     m_view = m;
     // Entering a grouped view starts fully collapsed so all headers are
     // visible at a glance; EnsureCurrentVisible then opens whichever
-    // header contains the current selection.
+    // header contains the current selection. Same treatment for Category
+    // and Cluster - the latter used to open every cluster but with 12+
+    // groups on a real library the user couldn't see what was there.
     if (m == ViewMode::Category)
         std::fill(m_cat_collapsed.begin(), m_cat_collapsed.end(), (char)1);
-    // Cluster view is intended for browsing by similarity: open every
-    // cluster so the user can scroll through sound-alike instruments
-    // without having to expand each header first.
     if (m == ViewMode::Cluster)
-        std::fill(m_cluster_collapsed.begin(), m_cluster_collapsed.end(), (char)0);
+        std::fill(m_cluster_collapsed.begin(), m_cluster_collapsed.end(), (char)1);
     RebuildViews();
 }
 
@@ -201,6 +203,71 @@ int Directory::EffectiveCategory(int node) const
 void Directory::SetClusterCount(int n)
 {
     m_cluster_collapsed.assign((size_t)std::max(0, n), 0);
+}
+
+std::string Directory::ClusterCharacterLabel(const std::vector<int>& members) const
+{
+    if (members.empty()) return std::string{};
+
+    // 1) Top-1 (and close top-2) effective category among members.
+    std::unordered_map<int, int> cat_count;
+    for (int f : members) {
+        int c = EffectiveCategory(f);
+        if (c >= 0 && c < (int)m_category_names.size()) ++cat_count[c];
+    }
+    std::vector<std::pair<int, int>> ranked(cat_count.begin(), cat_count.end());
+    std::sort(ranked.begin(), ranked.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::string cat_part;
+    if (!ranked.empty()) {
+        cat_part = m_category_names[ranked[0].first];
+        if (ranked.size() >= 2 &&
+            ranked[1].second >= (int)std::ceil(ranked[0].second * 0.6)) {
+            cat_part += " + " + m_category_names[ranked[1].first];
+        }
+    }
+
+    // 2) Mean audio features across members that actually have audio
+    // analysis. Anything skipped (audio_valid == false) doesn't contribute
+    // so cluster labels gracefully degrade on parametric-only caches.
+    float mean[8] = { 0 };
+    int valid = 0;
+    for (int f : members) {
+        const Node& n = m_nodes[f];
+        if (!n.audio_valid) continue;
+        for (int d = 0; d < 8; ++d) mean[d] += n.audio[d];
+        ++valid;
+    }
+    std::vector<std::string> descriptors;
+    if (valid > 0) {
+        for (int d = 0; d < 8; ++d) mean[d] /= (float)valid;
+        float meanRms = (mean[0] + mean[1] + mean[2]) / 3.0f;
+        // Thresholds mirror Analysis::TagsForInstrument so the cluster
+        // adjectives line up with the per-file tag strings users already see.
+        if (mean[5] > 4500.0f)                                descriptors.push_back("bright");
+        else if (mean[5] > 0.0f && mean[5] < 1500.0f)         descriptors.push_back("dark");
+        if (meanRms > 0.20f)                                  descriptors.push_back("loud");
+        else if (meanRms < 0.05f)                             descriptors.push_back("quiet");
+        // Envelope shape: percussive (sharp attack -> decay) vs sustained
+        // (steady through the window). Mutually exclusive.
+        if (mean[0] > 0.04f && mean[2] < mean[0] * 0.4f)      descriptors.push_back("percussive");
+        else if (mean[1] > 0.04f && std::fabs(mean[2] - mean[0]) < 0.02f)
+                                                              descriptors.push_back("sustained");
+        if (mean[7] > 0.40f)                                  descriptors.push_back("animated");
+        if (mean[3] > 0.10f)                                  descriptors.push_back("noisy");
+    }
+
+    std::string desc_str;
+    for (size_t i = 0; i < descriptors.size() && i < 3; ++i) {
+        if (i) desc_str += ", ";
+        desc_str += descriptors[i];
+    }
+
+    if (!cat_part.empty() && !desc_str.empty()) return cat_part + " (" + desc_str + ")";
+    if (!cat_part.empty())                      return cat_part;
+    if (!desc_str.empty())                      return "(" + desc_str + ")";
+    return std::string{};
 }
 
 void Directory::ToggleClusterCollapsed(int cluster)
@@ -361,12 +428,18 @@ void Directory::RebuildViews()
         for (int c = 0; c < ncat; ++c) add_group(m_category_names[c], c, false);
         add_group("(unanalysed)", ncat, true);  // unanalysed bucket index = ncat
     } else {
-        // Cluster view: collapsible header per k-means cluster. Cluster ids
-        // come from the analysis pass; clusters are numbered "Cluster N".
-        // Within each cluster, sort by spectral centroid (brightness)
-        // ascending so adjacent rows sound similar. Files without audio
-        // analysis (e.g. failed renders or v2-era caches) fall to the end
-        // of their cluster, alphabetically.
+        // Cluster view: collapsible header per k-means cluster. Each cluster
+        // header carries a generated label of the form
+        //   "Cluster 3 - Bass + Pad (dark, sustained) (24)"
+        // derived from member instruments: the top-1 (and close top-2)
+        // categories and a few audio-feature adjectives. Numbers stay so
+        // users can still refer to "Cluster 3"; the descriptive part is
+        // appended only when audio analysis was actually run.
+        //
+        // Within each cluster files are sorted by spectral centroid
+        // (brightness) ascending so adjacent rows sound similar; files
+        // without audio analysis fall to the end of their cluster,
+        // alphabetically.
         int ncl = (int)m_cluster_collapsed.size();
         auto add_cluster = [&](int cl, bool match_uncat) {
             std::vector<int> in;
@@ -388,11 +461,18 @@ void Directory::RebuildViews()
                 return na.name < nb.name;
             });
             bool collapsed = (cl >= 0 && cl < ncl) ? m_cluster_collapsed[cl] != 0 : false;
+            std::string label;
+            if (cl < 0) {
+                label = "(unclustered)";
+            } else {
+                label = "# " + std::to_string(cl + 1);
+                std::string character = ClusterCharacterLabel(in);
+                if (!character.empty()) label += " - " + character;
+            }
+            label += " (" + std::to_string(in.size()) + ")";
             Row hr;
             hr.is_header  = true;
-            hr.label      = (cl >= 0 ? ("Cluster " + std::to_string(cl + 1))
-                                     : std::string("(unclustered)"))
-                            + " (" + std::to_string(in.size()) + ")";
+            hr.label      = std::move(label);
             hr.header_cat = cl;
             hr.collapsed  = collapsed;
             m_rows.push_back(hr);

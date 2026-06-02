@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -143,6 +144,13 @@ int Bank::UsedCount() const
 
 bool Bank::IsFull() const { return UsedCount() >= SLOT_COUNT; }
 
+void Bank::SetClusterInfo(int slot, const std::string& info, std::uint64_t hash)
+{
+    if (slot < 0 || slot >= SLOT_COUNT) return;
+    m_slots[slot].cluster_info = info;
+    m_slots[slot].cluster_hash = hash;
+}
+
 int Bank::HighestUsedPlusOne() const
 {
     for (int i = SLOT_COUNT - 1; i >= 0; --i) {
@@ -163,7 +171,15 @@ int Bank::SaveTo(const std::string& outdir) const
 
     int written = 0;
     std::ofstream manifest(fs::path(outdir) / "manifest.txt", std::ios::trunc);
-    if (manifest) manifest << "# PokeyForge bank manifest. slot\tname\tsource\n";
+    if (manifest) {
+        manifest << "# PokeyForge bank manifest.\n"
+                    "# Columns: slot \\t name \\t source \\t cluster_info \\t cluster_hash\n"
+                    "# - cluster_info: multi-line; newlines escaped as '\\n'\n"
+                    "# - cluster_hash: hex FNV-1a of the slot's ATA when cluster_info was set\n"
+                    "# Both cluster columns are optional - older PokeyForge writes (or banks\n"
+                    "# never analysed) omit them, and the loader treats absent columns as\n"
+                    "# 'no cached cluster info'.\n";
+    }
 
     for (int i = 0; i < SLOT_COUNT; ++i) {
         const Slot& s = m_slots[i];
@@ -197,7 +213,25 @@ int Bank::SaveTo(const std::string& outdir) const
         if (len > 0) of.write(reinterpret_cast<const char*>(s.ata.data()), len);
 
         if (manifest) {
-            manifest << i << '\t' << s.name << '\t' << s.source_path << '\n';
+            // Escape \n and \t inside cluster_info so it round-trips through
+            // a one-line-per-slot manifest. Only \n is actually used today
+            // (FindClusterForBankSlot emits two-line strings) but escaping
+            // \t too keeps the format robust.
+            std::string esc;
+            esc.reserve(s.cluster_info.size());
+            for (char c : s.cluster_info) {
+                if      (c == '\\') esc += "\\\\";
+                else if (c == '\n') esc += "\\n";
+                else if (c == '\t') esc += "\\t";
+                else                esc += c;
+            }
+            char hashbuf[24];
+            std::snprintf(hashbuf, sizeof(hashbuf), "%016llx",
+                          (unsigned long long)s.cluster_hash);
+            manifest << i << '\t' << s.name << '\t' << s.source_path
+                     << '\t' << esc
+                     << '\t' << (s.cluster_info.empty() ? "" : hashbuf)
+                     << '\n';
         }
         ++written;
     }
@@ -339,12 +373,47 @@ int Bank::LoadFromManifest(const std::string& folder_or_manifest)
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
-        // Format: slot \t name \t source_path
-        size_t t1 = line.find('\t');
-        if (t1 == std::string::npos) continue;
-        int slot = std::atoi(line.substr(0, t1).c_str());
-        size_t t2 = line.find('\t', t1 + 1);
-        std::string src = (t2 == std::string::npos) ? "" : line.substr(t2 + 1);
+        // Format (current): slot \t name \t source \t cluster_info \t cluster_hash
+        // Format (legacy):  slot \t name \t source
+        // The two trailing fields are optional; missing or empty values
+        // leave the slot's cluster cache unset.
+        std::vector<std::string> cols;
+        {
+            size_t start = 0;
+            while (start <= line.size()) {
+                size_t t = line.find('\t', start);
+                cols.push_back(line.substr(start,
+                    (t == std::string::npos ? line.size() : t) - start));
+                if (t == std::string::npos) break;
+                start = t + 1;
+            }
+        }
+        if (cols.size() < 2) continue;
+        int slot = std::atoi(cols[0].c_str());
+        std::string src = (cols.size() >= 3) ? cols[2] : std::string{};
+
+        // Un-escape cluster_info written by SaveTo (\\ -> \, \n -> newline,
+        // \t -> tab).
+        std::string cluster_info;
+        if (cols.size() >= 4 && !cols[3].empty()) {
+            const std::string& raw = cols[3];
+            cluster_info.reserve(raw.size());
+            for (size_t i = 0; i < raw.size(); ++i) {
+                if (raw[i] == '\\' && i + 1 < raw.size()) {
+                    char n = raw[++i];
+                    if      (n == 'n')  cluster_info += '\n';
+                    else if (n == 't')  cluster_info += '\t';
+                    else if (n == '\\') cluster_info += '\\';
+                    else { cluster_info += '\\'; cluster_info += n; }
+                } else {
+                    cluster_info += raw[i];
+                }
+            }
+        }
+        std::uint64_t cluster_hash = 0;
+        if (cols.size() >= 5 && !cols[4].empty()) {
+            cluster_hash = std::strtoull(cols[4].c_str(), nullptr, 16);
+        }
 
         // Prefer the recorded source path; fall back to the NN_name.rti next
         // to the manifest.
@@ -361,7 +430,13 @@ int Bank::LoadFromManifest(const std::string& folder_or_manifest)
                 }
             }
         }
-        if (ok && slot >= 0 && slot < SLOT_COUNT && AddAt(slot, rti)) ++loaded;
+        if (ok && slot >= 0 && slot < SLOT_COUNT && AddAt(slot, rti)) {
+            // AddAt rebuilds the slot from the .rti, so it stomps any
+            // cluster fields the default Slot{} ctor left at empty/0.
+            // Restore them from the manifest now that the slot exists.
+            SetClusterInfo(slot, cluster_info, cluster_hash);
+            ++loaded;
+        }
     }
     return loaded;
 }

@@ -10,6 +10,9 @@ using Pokey_SoundInit_PROC  = void (*)(DWORD, WORD, BYTE);
 using Pokey_Process_PROC    = void (*)(BYTE*, const WORD);
 using Pokey_PutByte_PROC    = void (*)(WORD, BYTE);
 using Pokey_About_PROC      = void (*)(char**, char**, char**);
+using Pokey_GetAbi_PROC     = int  (*)();
+using Pokey_SetTap_PROC     = void (*)(Pokey::AudioTapFn, void*);
+using Pokey_SetMute_PROC    = void (*)(int);
 
 HINSTANCE g_dll = nullptr;
 Pokey_Initialise_PROC g_init = nullptr;
@@ -17,6 +20,10 @@ Pokey_SoundInit_PROC  g_sound_init = nullptr;
 Pokey_Process_PROC    g_process = nullptr;
 Pokey_PutByte_PROC    g_put_byte = nullptr;
 Pokey_About_PROC      g_about = nullptr;
+Pokey_GetAbi_PROC     g_get_abi = nullptr;
+Pokey_SetTap_PROC     g_set_tap = nullptr;
+Pokey_SetMute_PROC    g_set_mute = nullptr;
+int g_analysis_abi = 0;
 char g_about_text[512] = "sa_pokey not loaded";
 
 } // anonymous namespace
@@ -38,6 +45,12 @@ bool InitDll()
     g_process    = (Pokey_Process_PROC)   GetProcAddress(g_dll, "Pokey_Process");
     g_put_byte   = (Pokey_PutByte_PROC)   GetProcAddress(g_dll, "Pokey_PutByte");
     g_about      = (Pokey_About_PROC)     GetProcAddress(g_dll, "Pokey_About");
+
+    // Optional extensions: present only in PokeyForge-patched builds.
+    g_get_abi  = (Pokey_GetAbi_PROC)  GetProcAddress(g_dll, "Pokey_GetAnalysisAbiVersion");
+    g_set_tap  = (Pokey_SetTap_PROC)  GetProcAddress(g_dll, "Pokey_SetAudioTap");
+    g_set_mute = (Pokey_SetMute_PROC) GetProcAddress(g_dll, "Pokey_SetMute");
+    g_analysis_abi = (g_get_abi && g_set_tap && g_set_mute) ? g_get_abi() : 0;
 
     if (!g_init || !g_sound_init || !g_process || !g_put_byte) {
         std::fprintf(stderr, "Pokey::InitDll: sa_pokey.dll missing required exports\n");
@@ -62,6 +75,8 @@ void DeInitDll()
     g_dll = nullptr;
     g_init = nullptr; g_sound_init = nullptr; g_process = nullptr;
     g_put_byte = nullptr; g_about = nullptr;
+    g_get_abi = nullptr; g_set_tap = nullptr; g_set_mute = nullptr;
+    g_analysis_abi = 0;
 }
 
 void SoundInit(std::uint32_t clockHz, std::uint16_t samplesPerSec, std::uint8_t channels)
@@ -80,5 +95,18 @@ void Process(std::uint8_t* buffer, std::uint16_t numSamples)
 }
 
 const char* About() { return g_about_text; }
+
+bool HasAnalysisAbi()      { return g_analysis_abi != 0; }
+int  AnalysisAbiVersion()  { return g_analysis_abi; }
+
+void SetAudioTap(AudioTapFn fn, void* user)
+{
+    if (g_set_tap) g_set_tap(fn, user);
+}
+
+void SetMute(bool mute)
+{
+    if (g_set_mute) g_set_mute(mute ? 1 : 0);
+}
 
 } // namespace Pokey

@@ -76,10 +76,18 @@ is what you'll hear in RMT.
 **Build a bank**
 - Curate a **64-slot bank**; copy / cut / paste / reorder slots in EDIT mode.
 - **Right-click any bank slot** for a context menu (New / Clear / Export RTI /
-  Import RTI) — build instruments from scratch, replace a slot in place, or
-  export a single slot to a standalone `.rti`. Clear and Export are greyed
-  out on empty slots; hovered items light up so it's obvious which option
+  Import RTI / **Analyse**) — build instruments from scratch, replace a
+  slot in place, export a single slot to a standalone `.rti`, or analyse
+  the slot's instrument and see which library cluster it sounds like.
+  The cluster name (or **None** when never analysed) sits at the bottom
+  of the menu after a divider; Clear / Export / Analyse are greyed out
+  on empty slots; hovered items light up so it's obvious which option
   you're about to pick.
+- **Bank-wide Analyse** via the **Analyse** button on the bank title row
+  (left of `EDIT`) runs the per-slot classifier across every used slot
+  in one pass. Results persist with the bank — `manifest.txt` carries
+  each slot's cluster info plus the ATA hash it was computed against,
+  so reopening the bank shows the cluster on first right-click.
 - Save the bank as a set of individual `.RTI` files **and** a single
   RMT-compatible **`.RMT`** module (plus a manifest).
 - **Reload** a saved bank, **switch libraries** on the fly, and resume where you
@@ -293,7 +301,9 @@ In Edit mode:
 - The **focused panel** (Parameters, Envelope, Note table, or Name) gets a
   bright white frame, and a red cursor marks the exact cell you're changing. The
   **edit bar** at the bottom names the field, its value and range, and what it
-  does.
+  does. The Envelope panel header also flips the `[EDITING - Tab to switch]`
+  hint into the top-right corner (next to the Mono/Stereo toggle), so the
+  mini volume graph in the centre stays unobstructed.
 - `Tab` / `Shift+Tab` — move between the four panels.
 - Arrow keys — move the cell cursor.
 - `0`–`9`, `A`–`F` — type a value (two-digit fields compose); `+` / `-` nudge by
@@ -305,9 +315,18 @@ In Edit mode:
 - **Right-click** any binary field — an AUDCTL flag, the table type/mode, or an
   envelope filter/portamento cell — to flip it between 0 and 1 instantly,
   without typing. (Left-click any field to put the cursor there.)
+- **Mono ↔ Stereo toggle** in the Envelope panel header (and in the big
+  Vol popup's corner) flips the working instrument's encoding. In **mono**
+  any change to a `VolL` cell automatically mirrors to `VolR` and vice
+  versa — across hex-digit typing, `+` / `-` nudges, scroll-wheel
+  nudges, drag-paint, and the vol popup. The two channels stay locked
+  together until you switch to stereo. In **stereo** the channels are
+  independent; `↑` / `↓` buttons between the VolR and VolL sections of
+  the vol popup copy one channel onto the other in one undoable op.
 - Switching to a different instrument **exits Edit mode**, fully stops any
   ringing note, and silences the engine so the new instrument starts from a
-  clean slate.
+  clean slate. New / loaded instruments default to **mono** regardless of
+  their stored ATA encoding.
 - In the **Name** panel, type to insert characters, `Backspace` / `Delete` to
   remove (hold to repeat), arrows to move the caret.
 - `Ctrl` + an audition key — hear the instrument you're editing at that pitch;
@@ -369,9 +388,9 @@ library gets re-analysed on the next launch without manual intervention.
 **How categorisation works.** PokeyForge runs each `.RTI` through a fixed
 set of heuristics over its parameters, envelope, and note table; the checks
 fire in order and the first match wins, so a single instrument can only land
-in one bucket. The 13 buckets are: **Bass / Lead / Lead (vibrato) / Arp /
-Chord / Pad / Bell / Kick / Snare / HiHat / Perc / Swept FX / Noise / FX /
-Other**.
+in one bucket. The 15 buckets are: **Bass / Lead / Lead (vibrato) / Arp /
+Chord / Glide / Pad / Bell / Kick / Snare / HiHat / Perc / Swept FX /
+Noise / FX / Other**.
 
 Signals used:
 
@@ -411,10 +430,11 @@ The classification is still heuristic — treat the categories as a helpful
 rough grouping, not a strict taxonomy. Authoritative definitions live in
 `src/Analysis.cpp` (`Analysis::Classify`).
 
-**Audio-rendered features (v3).** Beyond the parametric signals above,
-PokeyForge now also *renders* each instrument through the engine for
-~186 ms at startup-analysis time and pulls back audio features from the
-resulting PCM:
+**Audio-rendered features (v7).** Beyond the parametric signals above,
+PokeyForge *renders* each instrument through the engine and pulls
+back float samples directly from the Altirra audio mixer through a
+custom audio tap (see *Patched POKEY DLL* below). Features computed
+per file:
 
 | Feature | What it measures |
 |--------|------------------|
@@ -434,9 +454,24 @@ the high-frequency mode.
 
 The audio thread is **paused** while analysis runs, so the shared engine
 isn't contended; the live instrument is reloaded when analysis finishes
-and audio resumes seamlessly. Analysis time is ~10-30 ms per instrument,
-so a 500-file library takes a few seconds. The splash shows a live
-**"N / M (X%)"** counter while it works.
+and audio resumes seamlessly. Throughput is roughly **~1 ms per
+instrument** (the engine runs far faster than realtime because the SDL
+device isn't gating it), so the bundled ~12,800-file library finishes
+in under 10 seconds. The splash shows a live **"N / M (X%)"** counter
+while it works.
+
+**Patched POKEY DLL.** The default `sa_pokey.dll` shipped with RMT memsets
+its `Pokey_Process` output buffer to silence and routes real audio out
+through a private native audio device — which makes it unusable for
+offline analysis. PokeyForge ships a custom `sa_pokey.dll` rebuilt from
+the AltirraSDL source with three extra exports (`Pokey_SetAudioTap`,
+`Pokey_SetMute`, `Pokey_GetAnalysisAbiVersion`) that surface the mixer's
+internal float stream and let us mute the native device. The full
+source for that build, plus a one-button `build.ps1`, lives under
+[`extras/sa_pokey-src/`](extras/sa_pokey-src/README.md). The patched
+DLL is otherwise a drop-in replacement for the stock RMT plugin (the
+RMT plugin contract is unchanged), and PokeyForge falls back to
+parametric-only analysis if loaded against the unpatched DLL.
 
 **Category colours.** Once a library is analysed, instrument rows in the
 directory tree are tinted by their effective category so you can see the
@@ -482,16 +517,49 @@ before clustering, so the result isn't dominated by whichever feature has
 the widest raw range; k-means++ seeding keeps the result deterministic.
 
 - **`F10`** (or the **Clusters** view-tab) groups the directory tree by
-  cluster instead of folder or category. Each header reads
-  `Cluster N (count)`; unclustered files (duplicates and any that the
-  audio render couldn't capture) land in a separate `(unclustered)`
-  group at the bottom.
+  cluster instead of folder or category. Headers **start collapsed** so
+  the whole cluster list is visible at a glance; click any header to
+  expand or collapse just that cluster. The cluster around the current
+  selection auto-expands so the highlighted row is never hidden under a
+  collapsed header.
 - The number of clusters defaults to `ceil(sqrt(N/2))` clamped to **[3,
   12]** — small libraries get 3 clusters, very large libraries cap at 12.
 - **`Ctrl+]`** / **`Ctrl+[`** override the cluster count for the *next*
   analysis run (the notice bar shows the active value). Press **F7** to
   re-analyse with the new k. **`Ctrl+] … Ctrl+[ … Ctrl+[`** back to 0
   goes back to the automatic choice.
+
+**Cluster names.** k-means produces unlabelled groups (Cluster 1, Cluster
+2, ...). PokeyForge derives a short descriptive label from each cluster's
+member instruments and appends it to the header:
+
+```
+Cluster 3 - Bass + Pad (dark, sustained) (24)
+```
+
+- **`Bass + Pad`** — the top-1 and (when close) top-2 categories among
+  the cluster's member files. Pure-category clusters show just one name;
+  mixed clusters show both. Manual overrides are respected.
+- **`dark, sustained`** — up to three adjectives derived from the
+  cluster's mean audio features, taken from the same vocabulary as the
+  per-file tags:
+
+  | Adjective    | Trigger                                              |
+  | ------------ | ---------------------------------------------------- |
+  | `bright`     | mean spectral centroid &gt; 4.5 kHz                  |
+  | `dark`       | mean spectral centroid &lt; 1.5 kHz                  |
+  | `loud`       | mean RMS &gt; 0.20                                   |
+  | `quiet`      | mean RMS &lt; 0.05                                   |
+  | `percussive` | sharp attack, near-silent tail                       |
+  | `sustained`  | flat RMS across the whole window                     |
+  | `animated`   | mean spectral flux &gt; 0.40 (timbre keeps moving)   |
+  | `noisy`      | mean zero-crossing rate &gt; 0.10                    |
+
+- **`(24)`** — number of instruments in the cluster.
+
+Files without audio analysis (duplicates, or rows from a parametric-only
+cache loaded against an unpatched `sa_pokey.dll`) land in a separate
+**`(unclustered)`** group at the bottom.
 
 Two instruments in the same cluster mean the analyser's audio measurements
 (RMS shape, ZCR, spectral centroid / rolloff / flux) sit near each other
@@ -598,17 +666,19 @@ app.
 | Key | Action |
 |-----|--------|
 | Mouse click | Select a bank slot (filled slot also loads it) |
-| `Tab` / `Shift+Tab` | Move the bank selection cursor forward / back |
-| `Ctrl` + `←` / `→` | Move the bank cursor by one slot |
-| `Ctrl` + `↑` / `↓` | Move the bank cursor by a row (±8) |
+| `Tab` / `Shift+Tab` | Move the bank selection cursor forward / back (no load) |
+| `Ctrl` + `←` / `→` | Step the bank cursor by one slot. Filled slots auto-load |
+| `Ctrl` + `↑` / `↓` | Step the bank cursor by a row (±8). Filled slots auto-load |
 | `+` (or `=`) | Add the current instrument to the next free slot |
 | `-` | Remove the current instrument from the bank |
-| `Ctrl` + `a`–`z`/`0`–`9` | Sample (play) the selected bank slot |
+| `Ctrl` + `a`–`z`/`0`–`9` | Sample (play) the selected bank slot (no load) |
 | `Ctrl+Ins` | Copy the current instrument into the selected slot (confirm if occupied) |
 | `Ctrl+Del` | Delete the selected slot (confirm) |
-| Right-click a slot | Open the context menu (New / Clear / Export RTI / Import RTI) |
-| **EDIT** button (bank panel) | Toggle bank-edit: when on, `Ctrl+C/X/V` move slots; when off they play |
+| Right-click a slot | Context menu: New / Clear / Export RTI / Import RTI / **Analyse** |
+| **Analyse** button (bank title) | Bank-wide cluster fingerprint pass (every used slot in one go) |
+| **EDIT** button (bank panel) | Toggle bank-edit: when on, `Ctrl+C/X/V/Y/S` edit; when off they play |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | (EDIT on) copy / cut / paste a bank slot (cut + paste = move/reorder) |
+| `Ctrl+Y` / `Ctrl+S` | (EDIT on) Redo / Export current instrument; outside EDIT they play |
 
 **Editing** (`F6` to toggle Edit mode)
 

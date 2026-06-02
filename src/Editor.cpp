@@ -154,38 +154,74 @@ bool Editor::InputHex(int nibble, TInstrument& ins)
 {
     if (nibble < 0 || nibble > 15) return false;
 
-    auto apply = [&](int cur, int maxv) -> int {
-        int v = m_typing_fresh ? nibble : ((cur << 4) | nibble);
-        m_typing_fresh = false;
-        return std::clamp(v, 0, maxv);
+    // Determine how many nibbles a field with this max value needs.
+    // maxv <= 15  → 1 nibble (single digit, 0-9/A-F constrained to range)
+    // maxv <= 255 → 2 nibbles (high then low; first digit commits high nibble)
+    auto field_nibbles = [](int maxv) { return (maxv <= 15) ? 1 : 2; };
+
+    // Apply one nibble of input to a field.
+    // single-nibble: digit must be <= maxv or the input is rejected (returns -1).
+    // two-nibble:    first call stores high nibble (partial value); second call
+    //                fills low nibble and triggers auto-advance (via advance_out).
+    // Returns the new value, or -1 if the digit was rejected.
+    auto apply = [&](int cur, int maxv, bool& advance_out) -> int {
+        if (field_nibbles(maxv) == 1) {
+            if (nibble > maxv) return -1;       // e.g. '5' typed into a 0-3 field
+            m_typing_fresh = true;              // reset immediately; field is done
+            advance_out = true;
+            return nibble;
+        } else {
+            // Two-nibble hex editor style.
+            if (m_typing_fresh) {
+                // First nibble: write to the high position, leave low as 0.
+                m_typing_fresh = false;
+                advance_out = false;
+                return std::clamp(nibble << 4, 0, maxv);
+            } else {
+                // Second nibble: keep the high nibble already set, fill the low.
+                m_typing_fresh = true;
+                advance_out = true;
+                return std::clamp((cur & 0xF0) | nibble, 0, maxv);
+            }
+        }
     };
 
     switch (panel) {
         case Panel::Params: {
             int pi, maxv; bool flag;
             ParamCell(param_idx, pi, maxv, flag);
-            int nv = apply(ins.parameters[pi], maxv);
-            if (nv == ins.parameters[pi]) return false;
+            bool adv = false;
+            int nv = apply(ins.parameters[pi], maxv, adv);
+            if (nv < 0) return false;           // rejected digit
+            bool changed = (nv != ins.parameters[pi]);
             ins.parameters[pi] = nv;
             Clamp(ins);
-            return true;
+            if (adv) Move(1, 0, ins);
+            return changed || adv;              // adv = state advanced even if value same
         }
         case Panel::Envelope: {
             int maxv; bool even; EnvRowRange(env_row, maxv, even);
-            int nv = apply(ins.envelope[env_col][env_row], maxv);
+            bool adv = false;
+            int nv = apply(ins.envelope[env_col][env_row], maxv, adv);
+            if (nv < 0) return false;
             if (even) nv &= 0x0E;
-            if (nv == ins.envelope[env_col][env_row]) return false;
+            bool changed = (nv != ins.envelope[env_col][env_row]);
             ins.envelope[env_col][env_row] = nv;
-            return true;
+            if (adv) Move(1, 0, ins);
+            return changed || adv;
         }
         case Panel::NoteTable: {
-            int nv = apply(ins.noteTable[tbl_idx], 255);
-            if (nv == ins.noteTable[tbl_idx]) return false;
+            bool adv = false;
+            int cur = ins.noteTable[tbl_idx] & 0xFF;
+            int nv = apply(cur, 255, adv);
+            if (nv < 0) return false;
+            bool changed = (nv != cur);
             ins.noteTable[tbl_idx] = nv;
-            return true;
+            if (adv) Move(1, 0, ins);
+            return changed || adv;
         }
         case Panel::Name:
-            return false; // name uses character input
+            return false;   // name uses character input
     }
     return false;
 }
@@ -316,6 +352,24 @@ Editor::FieldInfo Editor::Describe(const TInstrument& ins) const
             fi.vmin  = 0;
             fi.vmax  = p.max_value;
             fi.help  = p.help;
+            // Populate option pills for small-range (maxv<=3) named params.
+            if (idx < 12) {
+                // PAR_TBL_TYPE (idx 3, maxv 1)
+                if (p.par_index == PAR_TBL_TYPE) {
+                    static const char* kOpts[] = { "Notes", "Freqs", nullptr };
+                    fi.options = kOpts;
+                }
+                // PAR_TBL_MODE (idx 4, maxv 1)
+                else if (p.par_index == PAR_TBL_MODE) {
+                    static const char* kOpts[] = { "Set", "Add", nullptr };
+                    fi.options = kOpts;
+                }
+                // PAR_VIBRATO (idx 10, maxv 3)
+                else if (p.par_index == PAR_VIBRATO && p.max_value == 3) {
+                    static const char* kOpts[] = { "Off", "Low", "Mid", "Deep", nullptr };
+                    fi.options = kOpts;
+                }
+            }
             break;
         }
         case Panel::Envelope: {
@@ -330,7 +384,36 @@ Editor::FieldInfo Editor::Describe(const TInstrument& ins) const
             fi.value = ins.envelope[col][row];
             fi.vmin  = 0;
             fi.vmax  = maxv;
-            fi.help  = kEnvRows[row].help;
+            // For Command/Distortion rows show the description of the current
+            // cell value rather than the generic row help.
+            if (row == COMMAND) {
+                static const char* kCmdHelp[8] = {
+                    "Play BASE_NOTE + $XY semitones.",
+                    "Play frequency $XY.",
+                    "Play BASE_NOTE + frequency $XY.",
+                    "Set BASE_NOTE += $XY semitones. Play BASE_NOTE.",
+                    "Set FSHIFT += frequency $XY. Play BASE_NOTE.",
+                    "Set portamento speed $X, step $Y. Play BASE_NOTE.",
+                    "Set FILTER_SHFRQ += $XY. $0Y = BASS16 Distortion. $FF/$01 = Sawtooth inversion (Dist A).",
+                    "Set instrument AUDCTL. $FF = VOLUME ONLY mode. $FE/$FD = enable/disable Two-Tone Filter."
+                };
+                fi.help = kCmdHelp[std::clamp(fi.value, 0, 7)];
+            } else if (row == DISTORTION) {
+                // Indexed by (value >> 1) — distortion values are always even 0..E.
+                static const char* kDistHelp[8] = {
+                    "Dist 0: white noise. (AUDC $0v, Poly5+17/9)",
+                    "Dist 2: square-ish tones. (AUDC $2v, Poly5)",
+                    "Dist 4: no note table yet, Pure Table by default. (AUDC $4v, Poly4+5)",
+                    "Dist 6: 16-Bit tones in valid channels; use Cmd 6 to set distortion. (Dist A by default)",
+                    "Dist 8: white noise. (AUDC $8v, Poly17/9)",
+                    "Dist A: pure tones. CH1+CH3 1.79MHz + AUTOFILTER = Sawtooth. (AUDC $Av)",
+                    "Dist C: buzzy bass tones. (AUDC $Cv, Poly4)",
+                    "Dist E: gritty bass tones. (AUDC $Cv, Poly4)"
+                };
+                fi.help = kDistHelp[(std::clamp(fi.value & 0xFE, 0, 14)) >> 1];
+            } else {
+                fi.help = kEnvRows[row].help;
+            }
             break;
         }
         case Panel::NoteTable: {

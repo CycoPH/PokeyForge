@@ -26,4 +26,26 @@ void Process(std::uint8_t* buffer, std::uint16_t numSamples);
 
 const char* About();
 
+// ---- PokeyForge audio-capture extensions ---------------------------------
+// These wrap Pokey_SetAudioTap / Pokey_SetMute / Pokey_GetAnalysisAbiVersion
+// exposed by our patched sa_pokey.dll. They give us access to raw POKEY
+// float samples at the engine's native mix rate (~63920 Hz NTSC,
+// 63337 Hz PAL) without the device-buffer silencing that Pokey_Process
+// performs on its own output buffer. HasAnalysisAbi() returns true only
+// when the patched DLL is present; older shipped DLLs will report false
+// and the analysis path should fall back to "no audio features".
+
+// Signature mirrors ATRMTPokeyAudioTapFn from rmtinterface.cpp. `right`
+// is null in mono, otherwise interleaved-by-channel. `count` is samples
+// per channel. `timestamp` is the engine's cycle count (informational).
+using AudioTapFn = void (__cdecl *)(const float* left, const float* right,
+                                    std::uint32_t count, std::uint32_t timestamp,
+                                    void* user);
+
+bool HasAnalysisAbi();
+int  AnalysisAbiVersion();
+
+void SetAudioTap(AudioTapFn fn, void* user);
+void SetMute(bool mute);
+
 } // namespace Pokey
