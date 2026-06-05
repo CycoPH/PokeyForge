@@ -276,6 +276,13 @@ int Gui::TreeRowAtLogical(int x, int y) const
 		return -1;
 	}
 	if (y < m_tree_top || m_tree_rowh <= 0) return -1;
+	// Clip the click to the actual visible-rows region. Without this a
+	// click inside the spectral-signature panel (Cluster view) - which
+	// sits below the rows - would be mapped to a phantom row index and
+	// select an instrument the user can't see, possibly past the end of
+	// the list entirely.
+	const int rows_bottom = m_tree_top + m_tree_visible_rows * m_tree_rowh;
+	if (y >= rows_bottom) return -1;
 	int vis = (y - m_tree_top) / m_tree_rowh;
 	int idx = m_tree_scroll + vis;
 	if (idx < 0 || idx >= m_tree_row_count) return -1;
@@ -757,12 +764,18 @@ void Gui::DrawHeader(SDL_Renderer* r, const GuiState& s)
 {
 	FillRect(r, kPanel, 0, 0, kWinW, kHeaderH);
 
-	// Clickable menu bar.
+	// Clickable menu bar with hover highlight. Matches the accent fill /
+	// inverted text scheme used by the bank context menu and the help
+	// page-buttons, so a hovered menu item looks the same wherever it
+	// appears in the UI.
 	const int kMenuTxtY = kMenuY + std::max(0, (kMenuH - GlyphH()) / 2);
 	for (const auto& b : kMenu) {
-		FillRect(r, kPanelDark, b.x, kMenuY, b.w, kMenuH);
-		OutlineRect(r, kBorder, b.x, kMenuY, b.w, kMenuH);
-		DrawText(r, kHighlight, b.x + 8, kMenuTxtY, b.label);
+		const bool hovered =
+			s.mouse_x >= b.x && s.mouse_x < b.x + b.w &&
+			s.mouse_y >= kMenuY && s.mouse_y < kMenuY + kMenuH;
+		FillRect(r, hovered ? kAccent : kPanelDark, b.x, kMenuY, b.w, kMenuH);
+		OutlineRect(r, hovered ? kAccent : kBorder, b.x, kMenuY, b.w, kMenuH);
+		DrawText(r, hovered ? kBg : kHighlight, b.x + 8, kMenuTxtY, b.label);
 	}
 
 	// Status on the right (kept left of the scope in the top-right corner).
@@ -770,11 +783,32 @@ void Gui::DrawHeader(SDL_Renderer* r, const GuiState& s)
 	int used = s.bank ? s.bank->UsedCount() : 0;
 	DrawTextF(r, kText, 548, kHdrTxtY, "Clock: %s", s.ntsc ? "NTSC 60Hz" : "PAL 50Hz");
 	DrawTextF(r, kText, 690, kHdrTxtY, "Oct: %+d", s.octave_shift);
-	DrawTextF(r, kText, 766, kHdrTxtY, "Bank: %02d/64", used);
+	DrawTextF(r, kText, 755, kHdrTxtY, "Bank: %02d/64", used);
 
+	// [EDIT] and MODIFIED are pinned to the LEFT of the tone-number
+	// readout that hugs the scope's top-left corner (see DrawMasterScope,
+	// `#N` at scope_x - 28). With JetBrains Mono ptsize=13 the per-glyph
+	// width grew enough that the previous fixed-x=916 MODIFIED label
+	// extended past x=972 and overlaid the `#N` readout. Right-align both
+	// labels against tone_x_left with explicit pixel gaps so they always
+	// sit clear of the scope panel, regardless of the active font width.
 	bool editing = s.editor && s.editor->active;
-	if (editing)    DrawText(r, kHighlight, 858, kHdrTxtY, "[EDIT]");
-	if (s.modified) DrawText(r, kOrange, 916, kHdrTxtY, "MODIFIED");
+	const int gw = GlyphW();
+	const int kScopeW = 274;                            // matches DrawMasterScope
+	const int scope_x = kWinW - kScopeW - 6;
+	const int tone_x  = scope_x - 28;                   // "#NNN" readout's left edge
+	int pack_right = tone_x - 6;                        // 6 px gap to tone readout
+	if (s.modified) {
+		int w = (int)std::strlen("MODIFIED") * gw;
+		int x = pack_right - w;
+		DrawText(r, kOrange, x, kHdrTxtY, "MODIFIED");
+		pack_right = x - 8;                             // 8 px gap to next label
+	}
+	if (editing) {
+		int w = (int)std::strlen("[EDIT]") * gw;
+		int x = pack_right - w;
+		DrawText(r, kHighlight, x, kHdrTxtY, "[EDIT]");
+	}
 
 	// Master oscilloscope in the top-right corner.
 	DrawMasterScope(r, s);
@@ -826,12 +860,15 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 	int top = kHeaderH + 26;
 	// Reserve the bottom for the footer line, the search bar and command bar.
 	int bottom = kWinH - kCmdBarH - kSearchH - (GlyphH() + 4);
-	// In Cluster view we steal 72 px from the bottom of the row list to
+	// In Cluster view we steal a strip from the bottom of the row list to
 	// host the spectral signature panel (drawn below). The panel only
 	// appears in this view because that's where the user is browsing by
-	// similarity and the visual signature is most useful.
+	// similarity and the visual signature is most useful. Height scales
+	// with the TTF font so the title + bar chart + label row + the small
+	// margins always fit (an 8 px built-in font fits in 72 px, JetBrains
+	// Mono at ptsize=13 reports GlyphH() ~ 17 and needs ~95 px).
 	bool show_spectral = s.dir && s.dir->GetViewMode() == Directory::ViewMode::Cluster;
-	constexpr int kSpectralH = 72;
+	const int kSpectralH = 30 + 2 * GlyphH() + 28;  // title + bars + labels + margins
 	int spectral_top = 0;
 	if (show_spectral) {
 		spectral_top = bottom - kSpectralH;
@@ -974,6 +1011,7 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 		const int sy = spectral_top;
 		const int sw = kTreeW;
 		const int sh = kSpectralH;
+		const int gh = GlyphH();
 		// Background + thin divider lines (top / bottom) to set it apart
 		// from the tree above and the footer below without a full box.
 		FillRect(r, kPanelDark, sx + 4, sy, sw - 8, sh);
@@ -982,12 +1020,22 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 			(float)(sx + sw - 4), (float)sy);
 		SDL_RenderLine(r, (float)(sx + 4), (float)(sy + sh - 1),
 			(float)(sx + sw - 4), (float)(sy + sh - 1));
-		DrawText(r, kHighlight, sx + 8, sy + 4, "Audio signature");
+		// Title row: 4 px below the top divider, gh tall.
+		const int title_y = sy + 4;
+		DrawText(r, kHighlight, sx + 8, title_y, "Audio signature");
 
 		int cur = s.dir ? s.dir->CurrentNodeIndex() : -1;
 		bool have = (cur >= 0 && s.dir->At(cur).audio_valid);
+		// Bar chart sits between the title and the label row; pad 4 px on
+		// each side so neither row visually touches the bars. Label row
+		// hugs the bottom divider with 4 px breathing room above the
+		// divider and gh of vertical space for the text itself.
+		const int chartTop    = title_y + gh + 4;
+		const int chartBottom = sy + sh - 4 - gh - 2;   // 2 px gap between bars and labels
+		const int chartH      = std::max(8, chartBottom - chartTop);
+		const int labels_y    = chartBottom + 2;
 		if (!have) {
-			DrawText(r, kTextDim, sx + 8, sy + sh / 2,
+			DrawText(r, kTextDim, sx + 8, chartTop + (chartH - gh) / 2,
 				"(no audio analysis - press F7)");
 		}
 		else {
@@ -1005,9 +1053,6 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 				std::min(1.0f, n.audio[6] / 22050.0f),
 				std::min(1.0f, n.audio[7])
 			};
-			int chartTop = sy + 18;
-			int chartBottom = sy + sh - 14;
-			int chartH = chartBottom - chartTop;
 			int innerW = sw - 16;
 			int slotW = innerW / 8;
 			int barW = (slotW * 3) / 5;
@@ -1025,7 +1070,7 @@ void Gui::DrawTree(SDL_Renderer* r, const GuiState& s)
 				// baseline strip - helps spot "zero / unmeasured" features.
 				FillRect(r, kBorder, bx, chartBottom - 1, barW, 1);
 				int label_x = sx + 8 + i * slotW + (slotW - (int)std::strlen(labels[i]) * kGlyphW) / 2;
-				DrawText(r, kTextDim, label_x, chartBottom + 2, labels[i]);
+				DrawText(r, kTextDim, label_x, labels_y, labels[i]);
 			}
 		}
 	}
@@ -2405,325 +2450,434 @@ namespace {
 	struct HelpRow { const char* keys; const char* desc; };
 	struct HelpPage { const char* title; const HelpRow* rows; int count; };
 
-	// ----- Page 1: Keybindings (the original single-page content). -----
+	// Help is split into many short pages (~18 rows each) so it stays
+	// readable at TTF font sizes. Pages are grouped:
+	//   1-4   Keybindings (browsing, bank, tree views, edit-mode keys)
+	//   5     Categories
+	//   6     Tags & confidence
+	//   7     Audio features + manual overrides
+	//   8     Search syntax
+	//   9-10  Clusters (concepts, navigation)
+	//   11-12 Spectral signature panel (bars, reading)
+	//   13-15 Editor (panels, values, save/undo)
+
+	// ----- Page 1: Browsing & playback. -----
 	const HelpRow kHelpPage1[] = {
 		{ "Browsing & playback", "" },
-		{ "a .. z, 0 .. 9", "Play current instrument at chromatic pitches" },
-		{ "[  /  ]",        "Octave shift down / up (or wheel over 'Oct:')" },
-		{ "Left / Right",   "Previous / next .RTI (hold to repeat)" },
-		{ "Up / Down",      "Previous / next .RTI (hold to repeat)" },
-		{ "Mouse wheel",    "Move selection quickly (3 at a time)" },
-		{ "PageUp / PageDn","Jump by 10 files" },
-		{ "Home / End",     "First / last file" },
-		{ "/",              "Open the search bar (see page 3)" },
-		{ "Enter",          "Toggle current file's folder (collapse/expand)" },
-		{ "Esc",            "Silence playback (or close this help)" },
+		{ "a .. z, 0 .. 9",   "Play the current instrument at chromatic pitches" },
+		{ "[  /  ]",          "Octave down / up (or wheel over the 'Oct:' readout)" },
+		{ "Left / Right",     "Previous / next .RTI (hold to repeat)" },
+		{ "Up / Down",        "Previous / next .RTI (hold to repeat)" },
+		{ "Mouse wheel",      "Move the selection quickly (3 at a time)" },
+		{ "PageUp / PageDn",  "Jump by 10 files" },
+		{ "Home / End",       "First / last file in the current view" },
+		{ "Enter",            "Collapse / expand the current file's folder" },
+		{ "Esc",              "Silence playback (also closes this help)" },
+		{ "", "" },
+		{ "Search", "" },
+		{ "/",                "Open the search bar (page 8 covers syntax + @tags)" },
+		{ "", "" },
+		{ "Files", "" },
+		{ "Drag & drop",      "Drop a folder or .RTI onto the window to load it" },
+		{ "F2 / F3 / F4",     "Save bank / Load bank / Switch library" },
+	};
+
+	// ----- Page 2: Keybindings - Bank. -----
+	const HelpRow kHelpPage2[] = {
+		{ "Bank slot navigation", "" },
+		{ "Click slot",       "Select a slot. Filled slots auto-load the instrument" },
+		{ "Tab / Shift+Tab",  "Step the bank cursor forward / back (no load)" },
+		{ "Ctrl + arrows",    "Step the bank cursor. Filled slots auto-load;" },
+		{ "",                 "empty slots step over without touching what's loaded" },
+		{ "Ctrl + a-z / 0-9", "Audition the selected slot at that chromatic pitch" },
+		{ "", "" },
+		{ "Bank build", "" },
+		{ "+  (or =)",        "Add current instrument to the bank (dedupes by sound)" },
+		{ "-",                "Remove the current instrument from the bank" },
+		{ "Ctrl+Ins / Del",   "Copy current into / delete the selected slot" },
+		{ "Right-click slot", "Bank menu: New / Clear / Export / Import / Analyse" },
+		{ "Analyse button",   "(bank title row, left of EDIT) Fingerprint every" },
+		{ "",                 "used slot in one pass; results persist in manifest.txt" },
+	};
+
+	// ----- Page 3: Keybindings - Bank EDIT mode + tree views. -----
+	const HelpRow kHelpPage3[] = {
+		{ "Bank EDIT mode  (button on the bank title row)", "" },
+		{ "",  "When the EDIT toggle is on, Ctrl+letter is reserved for edit" },
+		{ "",  "verbs instead of slot audition. Outside EDIT, those keys fall" },
+		{ "",  "through to audition - so e.g. Ctrl+S can never accidentally" },
+		{ "",  "trigger a Save when you meant to play the 'S' note." },
+		{ "", "" },
+		{ "Ctrl+C / Ctrl+X",  "(EDIT) Copy / Cut the selected slot" },
+		{ "Ctrl+V",           "(EDIT) Paste into the selected slot" },
+		{ "Ctrl+Y",           "(EDIT) Redo the last instrument edit" },
+		{ "Ctrl+S",           "(EDIT) Export current instrument as a new .RTI" },
+		{ "Ctrl+Z",           "Undo - always available regardless of EDIT state" },
 		{ "", "" },
 		{ "Tree views", "" },
-		{ "F8",             "Toggle Categories view (group by classified category)" },
-		{ "F9",             "Toggle 'Hide duplicates' (curated list vs full library)" },
-		{ "F10",            "Toggle Clusters view (group by audio similarity)" },
-		{ "Click view tab", "'Folders / Categories / Clusters / Show all / No dupes'" },
-		{ "",               "tabs at the top of the tree mirror the F8 / F9 / F10 keys" },
-		{ "", "" },
-		{ "Bank", "" },
-		{ "+  (or =)",      "Add current instrument to bank (dedupes by sound)" },
-		{ "-",              "Remove current instrument from bank" },
-		{ "Click / Tab",    "Select a bank slot (click filled slot loads it)" },
-		{ "Ctrl+arrows",    "Move the bank cursor. Filled slots auto-load" },
-		{ "",               "(same as left-click). Empty slots step over without" },
-		{ "",               "touching what's currently loaded." },
-		{ "Ctrl+a-z/0-9",   "Sample (play) the selected bank slot (no load)" },
-		{ "Ctrl+Ins / Del", "Copy current into / delete selected slot (confirm)" },
-		{ "Right-click slot","Bank menu: New / Clear / Export / Import / Analyse" },
-		{ "Analyse button", "(bank title row, left of EDIT) Fingerprint every used" },
-		{ "",               "slot in one pass; results persist in the bank manifest." },
-		{ "Bank EDIT",      "Click the 'EDIT' button on the bank to flip into" },
-		{ "",               "EDIT mode. Ctrl+C / X / V / Y / S then operate on" },
-		{ "",               "the slot or instrument (Copy / Cut / Paste / Redo /" },
-		{ "",               "Save). Outside EDIT mode those keys fall through to" },
-		{ "",               "Ctrl+key audition so a stray Ctrl+S can't trigger a" },
-		{ "",               "Save when you meant to play the 'S' note." },
-		{ "",               "Ctrl+Z (Undo) stays available in both modes." },
-		{ "", "" },
-		{ "Editing  (F6 toggles Edit mode - see page 6)", "" },
-		{ "Click a field",  "Jump the edit cursor onto that parameter / cell / name" },
-		{ "Right-click",    "Toggle a binary field (AUDCTL / type / filter)" },
-		{ "Tab / arrows",   "(edit) cycle panel / move cell cursor" },
-		{ "0-9 A-F",        "(edit) type a value; +/- or Shift+Up/Dn to nudge" },
-		{ "Ctrl+key",       "(edit) audition while editing; Space re-triggers" },
-		{ "Ctrl+Z",         "Undo (always available)" },
-		{ "Ctrl+Y",         "Redo (requires Bank EDIT - else plays 'Y' note)" },
-		{ "Ctrl+S",         "Export current instrument as a new .RTI" },
-		{ "",               "(requires Bank EDIT - else plays 'S' note)" },
-		{ "", "" },
-		{ "Files & display", "" },
-		{ "Drag & drop",    "Drop a folder or .RTI onto the window to load" },
-		{ "F1",             "Toggle this help (Left/Right or wheel = pages, Esc close)" },
-		{ "F2 / F3 / F4",   "Save bank / Load bank / Switch library" },
-		{ "F5",             "Toggle PAL / NTSC" },
-		{ "F7",             "Re-analyse the library (see page 2)" },
-		{ "F11",            "Toggle fullscreen" },
+		{ "F8 / F9 / F10",    "Categories / Hide duplicates / Clusters toggle" },
+		{ "Click tab",        "Folders / Categories / Clusters / Show all / No dupes" },
+		{ "",                 "tabs above the tree mirror the F-keys" },
 	};
 
-	// ----- Page 2: Categories, tags, confidence, colours, overrides. -----
-	const HelpRow kHelpPage2[] = {
-		{ "What analysis does", "" },
+	// ----- Page 4: Keybindings - Editing & misc. -----
+	const HelpRow kHelpPage4[] = {
+		{ "Editing  (F6 toggles Edit mode - pages 13-15 cover the editor)", "" },
+		{ "F6",               "Toggle Edit mode on / off" },
+		{ "Click a field",    "Jump the cell cursor onto that parameter / cell / name" },
+		{ "Right-click",      "Toggle a binary field (AUDCTL bit / Filt / Port)" },
+		{ "Tab / Shift+Tab",  "(edit) Cycle through the four editable panels" },
+		{ "Arrow keys",       "(edit) Move the cell cursor within the panel" },
+		{ "0-9 A-F",          "(edit) Type a hex value into the cell" },
+		{ "+ / -",            "(edit) Nudge the cell by +/- 1" },
+		{ "Shift+Up / Down",  "(edit) Same as + / -" },
+		{ "Mouse wheel",      "(edit) Nudge the focused field by +/- 1" },
+		{ "Ctrl + key",       "(edit) Audition without leaving the cursor" },
+		{ "Space",            "(edit) Re-trigger the last audition note" },
+		{ "", "" },
+		{ "Display", "" },
+		{ "F1",               "Toggle this help (arrows / wheel = pages; Esc closes)" },
+		{ "F5",               "Toggle PAL / NTSC clock" },
+		{ "F7",               "Re-analyse the library (pages 5-7 explain the output)" },
+		{ "F11",              "Toggle fullscreen" },
+		{ "F12",              "Toggle audio path (TAP vs NATIVE, see About box)" },
+	};
+
+	// ----- Page 5: Analysis - Categories & confidence. -----
+	const HelpRow kHelpPage5[] = {
+		{ "What F7 does", "" },
 		{ "F7", "Re-analyse the library: classify every .RTI, find duplicates," },
 		{ "",   "render each through the engine for audio features, and cluster" },
-		{ "",   "by sonic similarity. Cached to analysis.json (portable - lives" },
-		{ "",   "next to your instruments folder)." },
+		{ "",   "by sonic similarity. Results are cached to analysis.json, which" },
+		{ "",   "lives next to your instruments folder and travels with it." },
 		{ "", "" },
-		{ "Categories  (Cat: ... in the header)", "" },
+		{ "Categories  (Cat: ... in the instrument header)", "" },
 		{ "",   "Each file is placed in ONE bucket. The 15 categories are:" },
-		{ "",   "Bass / Lead / Lead (vibrato) / Arp / Chord / Glide / Pad / Bell /" },
-		{ "",   "Kick / Snare / HiHat / Perc / Swept FX / Noise FX / Other." },
-		{ "",   "Directory rows are tinted by category so you can see them at a" },
-		{ "",   "glance. Selection still reads white-on-blue." },
+		{ "",   "  Bass / Lead / Lead (vibrato) / Arp / Chord / Glide / Pad" },
+		{ "",   "  Bell / Kick / Snare / HiHat / Perc / Swept FX / Noise FX / Other" },
+		{ "",   "Directory rows are tinted by category colour so you can see them" },
+		{ "",   "at a glance. The selected row still reads white-on-blue." },
 		{ "", "" },
-		{ "Confidence  (conf N)", "" },
+		{ "Confidence  (conf N in the header)", "" },
 		{ "",   "How many independent signals voted for the category (0-5)." },
-		{ "",   "1 = a guess - those rows are dimmed in the tree so you can spot" },
-		{ "",   "the analyser's weak calls and override them." },
+		{ "",   "Confidence 1 = a guess. Those rows are dimmed in the tree so you" },
+		{ "",   "can spot the analyser's uncertain calls and override them manually." },
 		{ "", "" },
-		{ "Tags  (orthogonal sub-labels)", "" },
-		{ "",   "A file can carry several tags alongside its category:" },
-		{ "",   "  vibrato     PAR_VIBRATO > 0" },
-		{ "",   "  bright/dark spectral centroid above 4.5k / below 1.5k Hz" },
-		{ "",   "  loud/quiet  mean RMS above 0.20 / below 0.05" },
-		{ "",   "  animated    spectral flux > 0.20 (timbre moves over time)" },
-		{ "",   "  highfreq    AUDCTL 15kHz / 1.79MHz bit set" },
-		{ "",   "  ascending / descending   note-table direction" },
-		{ "", "" },
-		{ "Audio features  (Cen / Rll / Atk / Mid / End / ZCR / Pk / Flx)", "" },
-		{ "",   "Cen / Rll  spectral centroid + 85% roll-off (kHz; brightness)" },
-		{ "",   "Atk/Mid/End  RMS in the first/middle/last third of the render" },
-		{ "",   "ZCR  zero-crossing rate (high = noisy)" },
-		{ "",   "Pk   peak-amplitude position (0 = attack, 1 = swell)" },
-		{ "",   "Flx  spectral flux (timbre motion frame-to-frame)" },
-		{ "", "" },
-		{ "Manual override", "" },
-		{ "Right-click row", "'Override category...' opens a colour-coded picker" },
-		{ "Ctrl+R",         "Cycle the current file's manual category" },
-		{ "Ctrl+Shift+R",   "Clear every manual override in the library" },
-		{ "",               "Overridden rows show an 'M' marker; the header reads" },
-		{ "",               "'Cat: <name> [M]'. Persisted in analysis.json." },
+		{ "Duplicates", "" },
+		{ "",   "Files whose rendered audio is byte-for-byte identical are marked" },
+		{ "",   "as duplicates. The 'No dupes' tab hides all but the first copy." },
+		{ "",   "F9 toggles the same filter from the keyboard." },
 	};
 
-	// ----- Page 3: Search syntax + examples. -----
-	const HelpRow kHelpPage3[] = {
-		{ "Opening the search bar", "" },
-		{ "/", "Start searching. Type to filter, Enter to keep the filter," },
-		{ "",  "Esc to clear and return to the full list. Arrow keys still move" },
-		{ "",  "between matches while the search bar is focused." },
+	// ----- Page 6: Analysis - Tags. -----
+	const HelpRow kHelpPage6[] = {
+		{ "Tags  (orthogonal sub-labels set alongside the category)", "" },
+		{ "",   "A file can carry several tags at once. They describe acoustic" },
+		{ "",   "properties, not category membership, so a file can be tagged" },
+		{ "",   "'loud' and 'bright' regardless of whether it is a Bass or a Lead." },
+		{ "", "" },
+		{ "Structural tags  (from instrument parameters)", "" },
+		{ "vibrato",    "PAR_VIBRATO > 0" },
+		{ "highfreq",   "AUDCTL 15 kHz / 1.79 MHz bit is set" },
+		{ "ascending",  "note-table values generally rise over the table length" },
+		{ "descending", "note-table values generally fall" },
+		{ "", "" },
+		{ "Audio tags  (from the rendered waveform)", "" },
+		{ "bright",    "spectral centroid above 4.5 kHz" },
+		{ "dark",      "spectral centroid below 1.5 kHz" },
+		{ "loud",      "mean RMS above 0.20" },
+		{ "quiet",     "mean RMS below 0.05" },
+		{ "animated",  "spectral flux > 0.20  (timbre changes a lot over time)" },
+		{ "", "" },
+		{ "Using tags in search  (page 8)", "" },
+		{ "@bright",       "all bright-centroid instruments" },
+		{ "@bright,loud",  "bright AND loud (comma = AND)" },
+		{ "@animated",     "FX / sweeps whose timbre moves over time" },
+		{ "@dark,quiet",   "dark + quiet (ambient pads, soft basses)" },
+		{ "", "" },
+		{ "Tags in the cluster view", "" },
+		{ "",   "Cluster names are built partly from the tags of their member files." },
+		{ "",   "Example: 'Cluster 3 - Bass + Pad (dark, sustained) (24)'" },
+		{ "",   "See pages 9-11 for the full cluster naming vocabulary." },
+	};
+
+	// ----- Page 7: Analysis - Audio features & manual override. -----
+	const HelpRow kHelpPage7[] = {
+		{ "Audio features  (shown in the instrument header after F7)", "" },
+		{ "Cen",  "Spectral centroid (kHz) - perceived brightness" },
+		{ "Rll",  "Spectral 85% roll-off (kHz) - where most energy stops" },
+		{ "Atk",  "RMS over the first 1/3 of the rendered window" },
+		{ "Mid",  "RMS over the middle 1/3" },
+		{ "End",  "RMS over the last 1/3" },
+		{ "ZCR",  "Zero-crossing rate (high = noisy / high-frequency content)" },
+		{ "Pk",   "Position of the absolute-peak sample (0 = attack, 1 = swell)" },
+		{ "Flx",  "Average frame-to-frame spectral change (0 = static timbre)" },
+		{ "", "" },
+		{ "Manual category override", "" },
+		{ "",               "If the analyser mis-classifies a file you can pin its" },
+		{ "",               "category manually. The override survives F7 re-analysis." },
+		{ "Right-click row","'Override category...' opens a colour-coded picker" },
+		{ "Ctrl+R",         "Cycle the current file's manual category (forward)" },
+		{ "Ctrl+Shift+R",   "Clear every manual override in the library at once" },
+		{ "", "" },
+		{ "How overrides are shown", "" },
+		{ "",   "Overridden rows display an 'M' marker at the right edge of the" },
+		{ "",   "tree row. The instrument header reads 'Cat: <name> [M]'." },
+		{ "",   "Overrides are stored in analysis.json alongside the analysis" },
+		{ "",   "cache so they travel with the library." },
+	};
+
+	// ----- Page 8: Search syntax. -----
+	const HelpRow kHelpPage8[] = {
+		{ "Opening and closing the search bar", "" },
+		{ "/",        "Open the search bar (also from the tree-pane footer area)" },
+		{ "Enter",    "Commit the filter and return focus to the tree" },
+		{ "Esc",      "Clear the filter and close the search bar" },
+		{ "",         "Arrow keys still move the selection while the bar is focused." },
 		{ "", "" },
 		{ "Substring search  (default)", "" },
-		{ "",  "Type anything that doesn't start with '@' and the directory" },
-		{ "",  "filters to instruments whose filename contains that text," },
-		{ "",  "case-insensitive." },
+		{ "",  "Type anything not starting with '@'. The directory filters to" },
+		{ "",  "instruments whose filename contains that text, case-insensitive." },
+		{ "", "" },
 		{ "Examples", "" },
-		{ "kick",        "matches  Bouncy_kick.rti,  kick_low.rti,  ..." },
-		{ "lead pwm",    "(no match - the space is literal text in the filename)" },
-		{ "vinscool",    "matches every file with 'vinscool' anywhere in its name" },
+		{ "kick",      "matches  Bouncy_kick.rti,  kick_low.rti,  ..." },
+		{ "vinscool",  "matches every file with 'vinscool' anywhere in its name" },
 		{ "", "" },
 		{ "Tag search  (@tag)", "" },
-		{ "",  "Prefix the query with '@' to filter by audio tags (see page 2)" },
-		{ "",  "instead of filenames. Combine tags with commas for AND match -" },
-		{ "",  "every listed tag must be set on the file." },
+		{ "",  "Prefix with '@' to filter by audio tags (page 6) instead of" },
+		{ "",  "filename. Combine tags with commas for AND matching - every" },
+		{ "",  "listed tag must be set on the file." },
+		{ "", "" },
 		{ "Examples", "" },
-		{ "@bright",         "all bright-centroid instruments" },
-		{ "@bright,loud",    "bright AND loud" },
-		{ "@vibrato",        "every Lead with vibrato (and any other vibrato sound)" },
-		{ "@animated",       "FX whose timbre moves over time" },
-		{ "@dark,quiet",     "dark + quiet (ambient pads, soft basses)" },
-		{ "@ascending",      "everything with a rising note-table pattern" },
+		{ "@bright",      "all bright-centroid instruments" },
+		{ "@bright,loud", "bright AND loud" },
+		{ "@vibrato",     "every instrument with vibrato set" },
+		{ "@animated",    "FX whose timbre moves over time" },
+		{ "@ascending",   "everything with a rising note-table pattern" },
 		{ "", "" },
 		{ "Recognised tag tokens", "" },
 		{ "",  "vibrato  bright  dark  loud  quiet  animated  highfreq" },
 		{ "",  "ascending  descending" },
 	};
 
-	// ----- Page 4: Clusters (what / how / names / navigating). -----
-	const HelpRow kHelpPage4[] = {
+	// ----- Page 9: Clusters - concept & how it works. -----
+	const HelpRow kHelpPage9[] = {
 		{ "What clusters are for", "" },
-		{ "",  "Categories tell you WHAT KIND of instrument something is. Clusters" },
-		{ "",  "tell you WHICH OTHERS it sounds like - based on the rendered audio," },
-		{ "",  "not on parameters or filename. Two files in the same cluster share" },
-		{ "",  "an overall sonic character regardless of how they're named." },
+		{ "",  "Categories tell you WHAT KIND of instrument something is." },
+		{ "",  "Clusters tell you WHICH OTHERS it sounds like - based on the" },
+		{ "",  "rendered audio, not on parameters or filename. Two files in the" },
+		{ "",  "same cluster share an overall sonic character regardless of how" },
+		{ "",  "they were named or organised on disk." },
 		{ "", "" },
 		{ "How clustering works", "" },
-		{ "",  "k-means runs over an 8-dimensional feature vector per file (RMS" },
-		{ "",  "profile + ZCR + peak position + centroid + rolloff + flux). The" },
-		{ "",  "values are standardised first (zero mean, unit variance per axis)" },
-		{ "",  "so no single dimension dominates. k-means++ seeding picks the" },
-		{ "",  "first centroid then each subsequent one as the point farthest from" },
-		{ "",  "any existing centroid - deterministic, no random restarts needed." },
+		{ "",  "k-means runs over an 8-dimensional feature vector per file:" },
+		{ "",  "  rms_early / rms_mid / rms_late  (attack / body / tail shape)" },
+		{ "",  "  ZCR  (noisiness)" },
+		{ "",  "  peak position  (where the loudest moment falls)" },
+		{ "",  "  centroid  (brightness)" },
+		{ "",  "  rolloff  (bandwidth)" },
+		{ "",  "  flux  (timbre motion)" },
+		{ "",  "Values are standardised (zero mean, unit variance per axis) so no" },
+		{ "",  "single feature dominates the distance calculation." },
 		{ "", "" },
+		{ "k-means++ seeding", "" },
+		{ "",  "The first centroid is chosen arbitrarily; each subsequent one is" },
+		{ "",  "the point farthest from any existing centroid. This is deterministic" },
+		{ "",  "- no random restarts, identical output for the same library." },
+	};
+
+	// ----- Page 10: Clusters - count, naming & adjectives. -----
+	const HelpRow kHelpPage10[] = {
 		{ "Cluster count  (k)", "" },
-		{ "",            "Default k = 24 (tuned for multi-thousand-file libraries)." },
-		{ "Ctrl+]  /  Ctrl+[",  "Step the cluster count for the next F7 (0 = auto)." },
-		{ "",                   "Auto uses ceil(sqrt(N/2)) clamped to [3, 12]." },
-		{ "",            "k is persisted in analysis.json so you don't have to" },
-		{ "",            "re-set it every launch; F7 re-analyses with the value" },
-		{ "",            "shown in the notice bar." },
+		{ "",                  "Default k = 24 (tuned for large libraries)." },
+		{ "Ctrl+]  /  Ctrl+[", "Step k up / down for the next F7 (0 = auto)." },
+		{ "",                  "Auto uses ceil(sqrt(N/2)) clamped to [3, 12]." },
+		{ "",                  "k is persisted in analysis.json; the notice bar shows" },
+		{ "",                  "the current value when you change it." },
 		{ "", "" },
 		{ "Cluster names", "" },
-		{ "",  "k-means produces unlabelled groups. PokeyForge appends a label:" },
-		{ "",  "    'Cluster 3 - Bass + Pad (dark, sustained) (24)'" },
+		{ "",  "k-means produces unlabelled groups. PokeyForge builds a label:" },
+		{ "",  "  'Cluster 3 - Bass + Pad (dark, sustained) (24)'" },
 		{ "",  "  Bass + Pad   top-1 (and close top-2) member categories" },
 		{ "",  "  dark/...     up to 3 adjectives from the cluster's mean features" },
 		{ "",  "  24           how many instruments are in the cluster" },
-		{ "",  "The adjective vocabulary mirrors the per-file tags from page 2:" },
-		{ "",  "  bright / dark        spectral centroid > 4.5k / < 1.5k Hz" },
-		{ "",  "  loud / quiet         mean RMS > 0.20 / < 0.05" },
-		{ "",  "  percussive           short attack, near-silent tail" },
-		{ "",  "  sustained            flat RMS across the whole window" },
-		{ "",  "  animated             spectral flux > 0.40 (timbre motion)" },
-		{ "",  "  noisy                zero-crossing rate > 0.10" },
 		{ "", "" },
-		{ "Using the cluster view", "" },
-		{ "F10",         "Toggle Clusters view (or click the 'Clusters' tab)" },
-		{ "",            "Headers start collapsed so the whole cluster list is" },
-		{ "",            "visible at a glance. Click a header to expand or collapse" },
-		{ "",            "that one cluster. The cluster around the current selection" },
-		{ "",            "auto-expands so the highlighted row is never hidden." },
-		{ "Hover header","Tooltip shows the full label (long names get truncated" },
-		{ "",            "in the tree pane; the tooltip wraps to two lines)." },
-		{ "",            "Within each cluster, rows are sorted by spectral centroid" },
-		{ "",            "(brightness) ascending - dark sounds first, bright last." },
+		{ "Adjective vocabulary  (derived from mean feature values)", "" },
+		{ "bright",     "mean spectral centroid > 4.5 kHz" },
+		{ "dark",       "mean spectral centroid < 1.5 kHz" },
+		{ "loud",       "mean RMS > 0.20" },
+		{ "quiet",      "mean RMS < 0.05" },
+		{ "percussive", "short attack, near-silent tail (rms_early >> rms_late)" },
+		{ "sustained",  "flat RMS profile across the whole render window" },
+		{ "animated",   "mean spectral flux > 0.40 (timbre keeps shifting)" },
+		{ "noisy",      "mean zero-crossing rate > 0.10" },
 	};
 
-	// ----- Page 5: Spectral signature panel. -----
-	const HelpRow kHelpPage5[] = {
-		{ "What the panel shows", "" },
+	// ----- Page 11: Clusters - using the view. -----
+	const HelpRow kHelpPage11[] = {
+		{ "Enabling the cluster view", "" },
+		{ "F10",             "Toggle Clusters view on / off" },
+		{ "Clusters tab",    "Click the tab above the tree to switch to Clusters" },
+		{ "", "" },
+		{ "Navigating the cluster list", "" },
+		{ "",            "Headers start COLLAPSED so the whole cluster list fits" },
+		{ "",            "in the pane at once. Click a cluster header to expand or" },
+		{ "",            "collapse that cluster's instrument list." },
+		{ "",            "The cluster that contains the current selection auto-expands" },
+		{ "",            "so the highlighted row is never hidden after navigation." },
+		{ "", "" },
+		{ "Cluster header tooltip", "" },
+		{ "Hover header", "The full cluster name appears as a tooltip. Long names" },
+		{ "",             "are truncated in the tree pane to fit; the tooltip always" },
+		{ "",             "shows the complete label, wrapped to two lines if needed." },
+		{ "", "" },
+		{ "Row order within a cluster", "" },
+		{ "",  "Rows are sorted by spectral centroid ascending - dark sounds" },
+		{ "",  "(low centroid) first, bright sounds (high centroid) last." },
+		{ "", "" },
+		{ "Spectral signature panel  (pages 12-13)", "" },
+		{ "",  "An 8-bar fingerprint chart appears below the cluster list when" },
+		{ "",  "the cluster view is active. It shows the selected file's cached" },
+		{ "",  "audio features. See pages 12-13 for what each bar means." },
+	};
+
+	// ----- Page 12: Spectral signature panel - bars. -----
+	const HelpRow kHelpPage12[] = {
+		{ "What the spectral panel shows", "" },
 		{ "",  "An 8-bar bar chart of the currently-selected instrument's cached" },
-		{ "",  "audio features. Drawn at the bottom of the tree pane, just above" },
-		{ "",  "the search bar. Each bar's height is one feature normalised into" },
-		{ "",  "[0, 1] - it's a visual fingerprint of the sound." },
+		{ "",  "audio features. It appears at the bottom of the tree pane, just" },
+		{ "",  "above the search bar, but only when the Cluster view is active." },
+		{ "",  "Each bar's height is one feature normalised to [0, 1] - it's a" },
+		{ "",  "visual fingerprint of the sound." },
 		{ "", "" },
 		{ "When it's visible", "" },
-		{ "",  "Cluster view only (F10). The Folder and Category views hide it" },
-		{ "",  "because their grouping isn't by audio similarity, so the per-row" },
-		{ "",  "visualisation doesn't add anything there. The data comes from" },
-		{ "",  "analysis.json - if you haven't run F7, or the cache is from a" },
-		{ "",  "parametric-only build, all bars sit at zero." },
+		{ "",  "Cluster view only (F10 / Clusters tab). Folder and Category views" },
+		{ "",  "hide it because their grouping isn't by audio similarity." },
+		{ "",  "If you haven't run F7 yet, all bars sit at zero." },
 		{ "", "" },
-		{ "The eight bars  (left -> right)", "" },
-		{ "Atk",  "rms_early - RMS over the first 1/3 of the rendered window" },
-		{ "Mid",  "rms_mid   - RMS over the middle 1/3" },
-		{ "End",  "rms_late  - RMS over the last 1/3" },
-		{ "ZCR",  "zero-crossing rate (0..1). High = noisy / high-frequency content" },
+		{ "The eight bars  (left to right)", "" },
+		{ "Atk",  "rms_early  - RMS over the first third of the rendered window" },
+		{ "Mid",  "rms_mid    - RMS over the middle third" },
+		{ "End",  "rms_late   - RMS over the last third" },
+		{ "ZCR",  "zero-crossing rate (0..1)  High = noisy / high-frequency" },
 		{ "Pk",   "position of the absolute-peak sample within the window" },
-		{ "",     "(0 = attack, 0.5 = mid, 1 = swell at the end)" },
-		{ "Cen",  "spectral centroid in Hz, divided by 22050 for the [0,1] axis" },
-		{ "",     "(perceived brightness - higher bar = brighter sound)" },
-		{ "Rll",  "spectral 85% roll-off in Hz, also normalised by 22050" },
-		{ "",     "(where most of the energy stops - tracks bandwidth)" },
+		{ "",     "  0 = attack peak,  0.5 = mid,  1 = swell at the very end" },
+		{ "Cen",  "spectral centroid in Hz, normalised by 22050" },
+		{ "",     "  perceived brightness - higher bar = brighter sound" },
+		{ "Rll",  "spectral 85% roll-off in Hz, normalised by 22050" },
+		{ "",     "  where most of the energy stops - tracks bandwidth" },
 		{ "Flx",  "average frame-to-frame spectral change" },
-		{ "",     "(0 = static timbre, higher = timbre keeps shifting)" },
-		{ "", "" },
-		{ "Reading the shape  (typical signatures)", "" },
-		{ "Kick",  "Atk tall, Mid/End decay sharply, Pk near 0, Flx high" },
-		{ "Hi-hat","Atk tall, Mid/End near zero, ZCR very high, Cen high" },
-		{ "Pad",   "Atk/Mid/End roughly equal (flat), Flx low" },
-		{ "Bass",  "Cen + Rll low, RMS profile moderate and steady" },
-		{ "Sweep", "Flx high (timbre moves), Atk/Mid/End similar height" },
-		{ "Bell",  "Cen high, ZCR moderate, peak position centred" },
-		{ "", "" },
-		{ "Colour and category cross-check", "" },
-		{ "",  "The bars are tinted with the file's category colour, matching the" },
-		{ "",  "row tint in the tree. If a row looks misclassified (e.g. tinted" },
-		{ "",  "as Pad but with a tall Atk and fast decay), the bar shape will" },
-		{ "",  "make the disagreement visible. Right-click -> Override category" },
-		{ "",  "to correct it (page 2 covers manual overrides)." },
+		{ "",     "  0 = static timbre,  higher = timbre keeps shifting" },
 	};
 
-	// ----- Page 6: Editing instruments in place. -----
-	const HelpRow kHelpPage6[] = {
-		{ "Edit mode  (F6 to enter / leave)", "" },
-		{ "",  "PokeyForge ships an in-place editor: F6 turns Browse into Edit." },
-		{ "",  "The focused panel grows a white frame, a red cell cursor appears" },
-		{ "",  "inside it, and the instrument header shows the edited fields'" },
-		{ "",  "current value + valid range under the panel name. An orange dot" },
-		{ "",  "next to the filename means there are unsaved changes." },
+	// ----- Page 13: Spectral signature panel - reading shapes. -----
+	const HelpRow kHelpPage13[] = {
+		{ "Typical bar shapes  (what to look for)", "" },
+		{ "Kick",   "Atk tall, Mid/End decay sharply, Pk near 0, Flx high" },
+		{ "Hi-hat", "Atk tall, Mid/End near zero, ZCR very high, Cen high" },
+		{ "Pad",    "Atk / Mid / End roughly equal (flat profile), Flx low" },
+		{ "Bass",   "Cen + Rll low, RMS bars moderate and roughly equal" },
+		{ "Sweep",  "Flx high (timbre moves), Atk/Mid/End at similar height" },
+		{ "Bell",   "Cen high, ZCR moderate, Pk roughly centred" },
+		{ "", "" },
+		{ "Colour and category cross-check", "" },
+		{ "",  "Bars are tinted with the file's category colour, matching the" },
+		{ "",  "row colour in the tree. If the bar shape doesn't match the tint" },
+		{ "",  "(e.g. Pad tint but tall Atk and fast decay), the file is likely" },
+		{ "",  "mis-classified. Right-click the tree row and choose" },
+		{ "",  "'Override category...' to correct it (page 7 for more detail)." },
+		{ "", "" },
+		{ "Relationship to cluster membership", "" },
+		{ "",  "Two files in the same cluster will tend to have similar bar" },
+		{ "",  "shapes. If the shapes look very different, it likely means they" },
+		{ "",  "ended up together by accident (outlier clustering). Those are" },
+		{ "",  "good candidates to inspect - the cluster view's right-click menu" },
+		{ "",  "lets you re-analyse a single slot to refresh its fingerprint." },
+	};
+
+	// ----- Page 14: Editor - entering, panels, cursor, values. -----
+	const HelpRow kHelpPage14[] = {
+		{ "Entering and leaving Edit mode", "" },
+		{ "F6",   "Toggle Edit mode on / off (also Esc to leave)" },
+		{ "",     "The focused panel gets a white frame; a red cell cursor appears" },
+		{ "",     "inside it. An orange dot next to the filename = unsaved changes." },
 		{ "", "" },
 		{ "The four editable panels", "" },
-		{ "Name",       "Instrument name text. Type characters; Backspace / Delete" },
-		{ "",           "edit; arrows move the insertion point. Max 32 chars." },
+		{ "Name",       "Instrument name text. Type characters directly." },
+		{ "",           "Backspace / Delete remove; arrows move the caret." },
+		{ "",           "Maximum 32 characters." },
 		{ "Parameters", "Top numeric panel - envelope length, table length, fade," },
 		{ "",           "vibrato, AUDCTL flags, etc. Two-digit hex fields compose" },
 		{ "",           "as you type (first nibble shifts left, second fills low)." },
-		{ "Envelope",   "16-column / 6-row grid: Volume L, Volume R (stereo)," },
-		{ "",           "Distortion, Audctl mods, Filter / Portamento flags, and" },
-		{ "",           "envelope command. Columns 0..PAR_ENV_LENGTH are active;" },
-		{ "",           "PAR_ENV_GOTO sets the loop point (column with the marker)." },
-		{ "Note table", "Per-step note offsets used by arps / chords / glides." },
-		{ "",           "Length is PAR_TBL_LENGTH (page 2 explains arp vs chord)." },
+		{ "Envelope",   "16-column x 6-row grid: Volume L, Volume R (stereo)," },
+		{ "",           "Distortion, AUDCTL mods, Filter / Portamento, and command." },
+		{ "",           "Columns 0..PAR_ENV_LENGTH are active." },
+		{ "Note table", "Per-step note offsets (arps / chords / glides)." },
+		{ "",           "Length is PAR_TBL_LENGTH." },
 		{ "", "" },
 		{ "Moving the cursor", "" },
-		{ "Tab / Shift+Tab", "Cycle through panels (Name -> Params -> Env -> Tbl)" },
-		{ "Arrow keys",      "Move within the current panel (rows / columns / cells)" },
-		{ "Click",           "Jump cursor straight to the clicked field (any panel)" },
-		{ "Esc",             "Exit Edit mode (equivalent to F6)" },
+		{ "Tab / Shift+Tab", "Cycle through panels  (Name -> Params -> Env -> Tbl)" },
+		{ "Arrow keys",      "Move within the current panel" },
+		{ "Click",           "Jump cursor to any clicked field" },
 		{ "", "" },
 		{ "Changing values", "" },
-		{ "0-9 A-F",         "Type a hex digit. Two-digit fields compose: first" },
-		{ "",                "press is the high nibble, second is the low. After" },
-		{ "",                "moving the cursor the next digit overwrites instead." },
-		{ "+ / -",           "Increment / decrement the current cell (+/- 1)" },
-		{ "Shift+Up / Down", "Same as +/- (faster on the keyboard)" },
-		{ "Mouse wheel",     "Nudge the focused field by +/- 1 (anywhere outside" },
-		{ "",                "the directory pane)" },
-		{ "Right-click",     "Toggle a binary field (AUDCTL flags, Filter row," },
-		{ "",                "Portamento flag, table type, table mode)" },
-		{ "", "" },
-		{ "Mono vs Stereo (Envelope panel header toggle)", "" },
-		{ "",                "Loaded instruments default to MONO regardless of how" },
-		{ "",                "they're encoded on disk. The 'Mono' / 'Stereo' button" },
-		{ "",                "in the Envelope header (and in the big Vol popup's" },
-		{ "",                "top-right) flips the working instrument's encoding." },
-		{ "",                "In MONO any change to a VolL cell mirrors to VolR" },
-		{ "",                "and vice versa - across hex digits, +/- nudges," },
-		{ "",                "scroll-wheel, drag-paint, and the vol popup. The two" },
-		{ "",                "channels stay locked until you flip to stereo." },
-		{ "",                "In STEREO the channels are independent; the popup's" },
-		{ "",                "up / down arrows between sections copy one row over" },
-		{ "",                "the other in one undoable op." },
+		{ "0-9 A-F",         "Type a hex digit (two-digit fields compose)" },
+		{ "+ / -",           "Increment / decrement by 1" },
+		{ "Shift+Up / Down", "Same as +/-" },
+		{ "Mouse wheel",     "Nudge the focused field by +/- 1" },
+		{ "Right-click",     "Toggle a binary field (AUDCTL, Filter, Port flag)" },
+	};
+
+	// ----- Page 15: Editor - mono/stereo, audition, undo, save. -----
+	const HelpRow kHelpPage15[] = {
+		{ "Mono vs Stereo  (toggle in the Envelope panel header)", "" },
+		{ "",   "Loaded instruments default to MONO. The 'Mono' / 'Stereo' button" },
+		{ "",   "in the Envelope header (and in the vol popup) flips the encoding." },
+		{ "",   "In MONO, any change to VolL mirrors to VolR and vice versa" },
+		{ "",   "- across hex digits, +/- nudges, scroll-wheel, drag-paint, and" },
+		{ "",   "the vol popup. The channels stay locked until you flip to Stereo." },
+		{ "",   "In STEREO the channels are independent. The popup's up / down" },
+		{ "",   "arrows between sections copy one row over the other (one undo step)." },
 		{ "", "" },
 		{ "Audition while editing", "" },
-		{ "Ctrl + a-z / 0-9", "Play a note WITHOUT leaving the cell cursor. The" },
-		{ "",                 "modifier prevents the key from being interpreted as" },
-		{ "",                 "a hex digit, so you can listen between edits." },
-		{ "Space",            "Re-trigger the last note (same pitch, latest changes)" },
+		{ "Ctrl + a-z / 0-9", "Play a note without leaving the cursor. Ctrl" },
+		{ "",                 "prevents the key being read as a hex digit." },
+		{ "Space",            "Re-trigger the last note with the latest changes." },
 		{ "", "" },
-		{ "Undo, save, export", "" },
-		{ "Ctrl+Z",           "Undo. Always available - the undo stack survives" },
-		{ "",                 "across panel switches and resets when you load a" },
-		{ "",                 "different instrument." },
-		{ "Ctrl+Y",           "Redo. Bank EDIT mode required (page 1) - outside" },
-		{ "",                 "EDIT mode Ctrl+Y plays the 'Y' note as audition." },
-		{ "Ctrl+S",           "Export the working copy as a new .RTI file." },
-		{ "",                 "Same gate as Ctrl+Y: Bank EDIT must be on, so the" },
-		{ "",                 "Save can't fire when you meant to audition 'S'." },
-		{ "",                 "The Save dialog defaults to the current library" },
-		{ "",                 "folder; the on-disk source file is never over-" },
-		{ "",                 "written - every Ctrl+S is 'Save As' to keep" },
-		{ "",                 "modifications auditable." },
+		{ "Undo and redo", "" },
+		{ "Ctrl+Z",  "Undo. Always available; stack resets on instrument load." },
+		{ "Ctrl+Y",  "Redo. Requires Bank EDIT mode - outside EDIT, Ctrl+Y" },
+		{ "",        "plays the 'Y' note so it can't fire by accident." },
 		{ "", "" },
-		{ "Visual cues", "" },
-		{ "Orange dot",       "Unsaved changes on the working copy" },
-		{ "White panel frame","The panel that has cell focus" },
-		{ "Red cell box",     "Cell currently under the cursor" },
-		{ "Header subline",   "<panel> <field name>: <value> [range]   <doc string>" },
+		{ "Saving / exporting", "" },
+		{ "Ctrl+S",  "Export the working copy as a new .RTI file." },
+		{ "",        "Requires Bank EDIT mode (same reason as Ctrl+Y above)." },
+		{ "",        "Defaults to the current library folder. The on-disk source" },
+		{ "",        "is never overwritten - every Ctrl+S is effectively Save As." },
+		{ "", "" },
+		{ "Visual cues at a glance", "" },
+		{ "Orange dot",        "Unsaved changes on the working copy" },
+		{ "White panel frame", "The panel that has cell focus" },
+		{ "Red cell box",      "The cell currently under the cursor" },
+		{ "Header subline",    "<panel>  <field>: <value> [range]  <description>" },
 	};
 
 	const HelpPage kHelpPages[] = {
-		{ "Keybindings",            kHelpPage1, (int)(sizeof(kHelpPage1) / sizeof(kHelpPage1[0])) },
-		{ "Categories & analysis",  kHelpPage2, (int)(sizeof(kHelpPage2) / sizeof(kHelpPage2[0])) },
-		{ "Search syntax",          kHelpPage3, (int)(sizeof(kHelpPage3) / sizeof(kHelpPage3[0])) },
-		{ "Clusters",               kHelpPage4, (int)(sizeof(kHelpPage4) / sizeof(kHelpPage4[0])) },
-		{ "Spectral signature panel", kHelpPage5, (int)(sizeof(kHelpPage5) / sizeof(kHelpPage5[0])) },
-		{ "Editor",                 kHelpPage6, (int)(sizeof(kHelpPage6) / sizeof(kHelpPage6[0])) },
+		{ "Browsing & playback",    kHelpPage1,  (int)(sizeof(kHelpPage1)  / sizeof(kHelpPage1[0]))  },
+		{ "Bank navigation",        kHelpPage2,  (int)(sizeof(kHelpPage2)  / sizeof(kHelpPage2[0]))  },
+		{ "Bank EDIT & tree views", kHelpPage3,  (int)(sizeof(kHelpPage3)  / sizeof(kHelpPage3[0]))  },
+		{ "Editing & display keys", kHelpPage4,  (int)(sizeof(kHelpPage4)  / sizeof(kHelpPage4[0]))  },
+		{ "Categories & analysis",  kHelpPage5,  (int)(sizeof(kHelpPage5)  / sizeof(kHelpPage5[0]))  },
+		{ "Tags",                   kHelpPage6,  (int)(sizeof(kHelpPage6)  / sizeof(kHelpPage6[0]))  },
+		{ "Audio features",         kHelpPage7,  (int)(sizeof(kHelpPage7)  / sizeof(kHelpPage7[0]))  },
+		{ "Search syntax",          kHelpPage8,  (int)(sizeof(kHelpPage8)  / sizeof(kHelpPage8[0]))  },
+		{ "Clusters - concept",     kHelpPage9,  (int)(sizeof(kHelpPage9)  / sizeof(kHelpPage9[0]))  },
+		{ "Clusters - count/names", kHelpPage10, (int)(sizeof(kHelpPage10) / sizeof(kHelpPage10[0])) },
+		{ "Clusters - view",        kHelpPage11, (int)(sizeof(kHelpPage11) / sizeof(kHelpPage11[0])) },
+		{ "Spectral panel - bars",  kHelpPage12, (int)(sizeof(kHelpPage12) / sizeof(kHelpPage12[0])) },
+		{ "Spectral - shapes",      kHelpPage13, (int)(sizeof(kHelpPage13) / sizeof(kHelpPage13[0])) },
+		{ "Editor - panels",        kHelpPage14, (int)(sizeof(kHelpPage14) / sizeof(kHelpPage14[0])) },
+		{ "Editor - save/undo",     kHelpPage15, (int)(sizeof(kHelpPage15) / sizeof(kHelpPage15[0])) },
 	};
 	static_assert((int)(sizeof(kHelpPages) / sizeof(kHelpPages[0])) == Gui::kHelpPageCount,
 	              "kHelpPageCount in Gui.h must match the number of kHelpPages entries");
@@ -2736,6 +2890,18 @@ namespace {
 	// canvas with 16 px breathing room on all sides. The Prev / Next paging
 	// buttons live in the bottom-right corner; the renderer and the hit-test
 	// both compute their rects through this helper so they can't drift.
+	// Topic shortcut buttons: label + target page (0-based).
+	struct HelpTopic { const char* label; int page; };
+	constexpr HelpTopic kHelpTopics[] = {
+		{ "Bindings", 0  },
+		{ "Analysis", 4  },
+		{ "Search",   7  },
+		{ "Clusters", 8  },
+		{ "Spectral", 11 },
+		{ "Editor",   13 },
+	};
+	constexpr int kHelpTopicCount = (int)(sizeof(kHelpTopics) / sizeof(kHelpTopics[0]));
+
 	struct HelpGeom {
 		int x, y, w, h;          // outer panel
 		int row_h;
@@ -2746,26 +2912,65 @@ namespace {
 		int btn_w, btn_h;
 		int prev_x, prev_y;
 		int next_x, next_y;
+		// Topic shortcut buttons (same row as prev/next, left-aligned).
+		int topic_btn_w;         // uniform width for all topic buttons
+		int topic_btn_x0;        // left edge of the first topic button
+		int topic_btn_y;         // top edge (same as prev_y)
+		int topic_btn_gap;       // horizontal gap between topic buttons
 	};
 	HelpGeom ComputeHelpGeom()
 	{
+		// All sizes derive from the active font (8 px built-in or TTF)
+		// so the panel scales correctly with JetBrains Mono / SDL3_ttf,
+		// which has roughly 11 px glyph width and 17 px line height
+		// vs the 8x8 fallback. The previous fixed offsets crammed
+		// rows together and clipped the "< Prev" / "Next >" buttons.
+		const int gw = GlyphW();
+		const int gh = GlyphH();
+
 		HelpGeom g;
-		g.w = 880;
-		g.h = 688;                  // fits in 720 with 16 px margin top/bottom
+		g.w = 900;
+		g.h = 700;                       // fits in 720 with 10 px margin top/bottom
 		g.x = (kWinW - g.w) / 2;
 		g.y = (kWinH - g.h) / 2;
-		g.row_h = 13;               // 8 px font + 5 px spacing
-		g.content_top = g.y + 48;
-		g.content_left = g.x + 28;
-		g.desc_x = g.x + 260;
-		g.content_right = g.x + g.w - 20;
-		g.footer_y = g.y + g.h - 22;
-		g.btn_w = 64;
-		g.btn_h = 18;
-		g.next_x = g.x + g.w - 20 - g.btn_w;
-		g.prev_x = g.next_x - g.btn_w - 8;
-		g.next_y = g.footer_y - 4;
-		g.prev_y = g.next_y;
+
+		// Content rows: text line + breathing room. ~50% extra spacing
+		// gives a clearly-readable list at TTF sizes without wasting too
+		// much vertical real estate.
+		g.row_h = gh + (gh / 2);
+
+		// Keys column starts after the left margin; description column is
+		// wide enough for ~22 chars of key text at the current font.
+		g.content_left  = g.x + 28;
+		g.desc_x        = g.x + 28 + (gw * 22) + 12;
+		g.content_right = g.x + g.w - 24;
+
+		// Title row at the top: gh-tall text with 18 px top padding plus
+		// a 6 px gap before the underline, then 12 px more before content.
+		g.content_top = g.y + 18 + gh + 6 + 12;
+
+		// Footer line + paging buttons at the bottom. Buttons need to be
+		// tall enough for the font with breathing room; the labels
+		// "< Prev" / "Next >" are 6 chars so we size for 8 chars of
+		// padding to keep them clearly clickable at any font width.
+		g.btn_h = gh + 10;
+		g.btn_w = gw * 8 + 16;
+		// Footer hint sits at the very bottom of the panel.
+		g.footer_y  = g.y + g.h - gh - 10;
+		// Buttons stack just above the footer hint with an 8 px gap.
+		g.next_y    = g.footer_y - g.btn_h - 8;
+		g.prev_y    = g.next_y;
+		g.next_x    = g.content_right - g.btn_w;
+		g.prev_x    = g.next_x - g.btn_w - 10;
+
+		// Topic buttons: same height/row as prev/next, starting from the
+		// content left margin. Width sized for the longest label ("Bindings"
+		// = 8 chars) plus padding; gap is 6 px between buttons.
+		g.btn_h        = gh + 10;        // already set above, kept for clarity
+		g.topic_btn_w  = gw * 8 + 14;
+		g.topic_btn_gap = 6;
+		g.topic_btn_x0  = g.content_left;
+		g.topic_btn_y   = g.next_y;      // same row as prev/next
 		return g;
 	}
 
@@ -2781,29 +2986,34 @@ void Gui::DrawHelpOverlay(SDL_Renderer* r, const GuiState& s)
 	int total_pages = kHelpPageCount;
 	int page = std::clamp(s.help_page, 0, total_pages - 1);
 	const HelpPage& hp = kHelpPages[page];
+	const int gw = GlyphW();
+	const int gh = GlyphH();
 
 	FillRect(r, Col{ 30, 34, 44, 245 }, g.x, g.y, g.w, g.h);
 	OutlineRect(r, kAccent, g.x, g.y, g.w, g.h);
 	OutlineRect(r, kAccent, g.x + 1, g.y + 1, g.w - 2, g.h - 2);
 
 	// Title + page indicator.
+	const int title_y = g.y + 18;
 	char title[128];
 	std::snprintf(title, sizeof(title), "PokeyForge  -  %s", hp.title);
-	DrawText(r, kHighlight, g.x + 20, g.y + 18, title);
+	DrawText(r, kHighlight, g.x + 20, title_y, title);
 	char pageInfo[40];
 	std::snprintf(pageInfo, sizeof(pageInfo), "Page %d / %d", page + 1, total_pages);
-	int piw = (int)std::strlen(pageInfo) * kGlyphW;
-	DrawText(r, kTextDim, g.content_right - piw, g.y + 18, pageInfo);
+	int piw = (int)std::strlen(pageInfo) * gw;
+	DrawText(r, kTextDim, g.content_right - piw, title_y, pageInfo);
 
+	const int title_divider_y = title_y + gh + 6;
 	SetCol(r, kBorder);
-	SDL_RenderLine(r, (float)(g.x + 20), (float)(g.y + 34),
-		(float)(g.content_right), (float)(g.y + 34));
+	SDL_RenderLine(r, (float)(g.x + 20), (float)title_divider_y,
+		(float)(g.content_right), (float)title_divider_y);
 
 	// Content rows. Empty key+desc = blank line; non-empty key with empty
 	// desc = section heading. Rows that overflow the available height are
-	// silently clipped (shouldn't happen with the current page sizes).
+	// silently clipped - kHelpPages are sized to fit at TTF dimensions.
 	int y = g.content_top;
-	int max_y = g.footer_y - 18;
+	const int footer_divider_y = g.next_y - 8;
+	const int max_y = footer_divider_y - g.row_h / 2;
 	for (int i = 0; i < hp.count && y + g.row_h <= max_y; ++i) {
 		const HelpRow& row = hp.rows[i];
 		bool has_key = row.keys && row.keys[0];
@@ -2819,26 +3029,53 @@ void Gui::DrawHelpOverlay(SDL_Renderer* r, const GuiState& s)
 		y += g.row_h;
 	}
 
-	// Footer divider + hint text on the left, paging buttons on the right.
+	// Footer divider sits 8 px above the paging buttons; the hint text
+	// sits at the very bottom of the panel below the buttons.
 	SetCol(r, kBorder);
-	SDL_RenderLine(r, (float)(g.x + 20), (float)(g.footer_y - 6),
-		(float)(g.content_right), (float)(g.footer_y - 6));
-	DrawText(r, kTextDim, g.x + 20, g.footer_y,
-		"Left / Right or wheel  page    Esc / F1  close    click outside  dismiss");
+	SDL_RenderLine(r, (float)(g.x + 20), (float)footer_divider_y,
+		(float)(g.content_right), (float)footer_divider_y);
 
 	// Clickable Prev / Next buttons. Hover highlight matches the rest of
-	// the modal popups (kAccent fill + kBg text on hover).
+	// the modal popups (kAccent fill + kBg text on hover). The label is
+	// centred using measured pixel widths so it always fits regardless of
+	// the active font.
 	auto draw_btn = [&](int bx, int by, const char* label) {
 		bool hovered = (s.mouse_x >= bx && s.mouse_x < bx + g.btn_w &&
 			s.mouse_y >= by && s.mouse_y < by + g.btn_h);
 		FillRect(r, hovered ? kAccent : kPanelDark, bx, by, g.btn_w, g.btn_h);
 		OutlineRect(r, kAccent, bx, by, g.btn_w, g.btn_h);
-		int tw = (int)std::strlen(label) * kGlyphW;
+		int tw = (int)std::strlen(label) * gw;
 		DrawText(r, hovered ? kBg : kHighlight,
-			bx + (g.btn_w - tw) / 2, by + (g.btn_h - 8) / 2, label);
+			bx + (g.btn_w - tw) / 2,
+			by + std::max(0, (g.btn_h - gh) / 2),
+			label);
 	};
 	draw_btn(g.prev_x, g.prev_y, "< Prev");
 	draw_btn(g.next_x, g.next_y, "Next >");
+
+	// Topic shortcut buttons. The active topic's button is highlighted with
+	// kAccent fill (same as hover) to show which section is current.
+	for (int i = 0; i < kHelpTopicCount; ++i) {
+		const HelpTopic& t = kHelpTopics[i];
+		int bx = g.topic_btn_x0 + i * (g.topic_btn_w + g.topic_btn_gap);
+		int by = g.topic_btn_y;
+		bool active  = (page >= t.page &&
+		               (i + 1 >= kHelpTopicCount || page < kHelpTopics[i + 1].page));
+		bool hovered = (s.mouse_x >= bx && s.mouse_x < bx + g.topic_btn_w &&
+		                s.mouse_y >= by && s.mouse_y < by + g.btn_h);
+		Col fill = (active || hovered) ? kAccent : kPanelDark;
+		Col text = (active || hovered) ? kBg      : kTextDim;
+		FillRect(r, fill, bx, by, g.topic_btn_w, g.btn_h);
+		OutlineRect(r, kAccent, bx, by, g.topic_btn_w, g.btn_h);
+		int tw = (int)std::strlen(t.label) * gw;
+		DrawText(r, text,
+			bx + (g.topic_btn_w - tw) / 2,
+			by + std::max(0, (g.btn_h - gh) / 2),
+			t.label);
+	}
+
+	DrawText(r, kTextDim, g.x + 20, g.footer_y,
+		"Left / Right or wheel: page    Esc / F1: close    Click outside: dismiss");
 
 	SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_NONE);
 }
@@ -2850,6 +3087,18 @@ int Gui::HelpPageButtonAtLogical(int x, int y) const
 	if (x >= g.prev_x && x < g.prev_x + g.btn_w) return -1;
 	if (x >= g.next_x && x < g.next_x + g.btn_w) return +1;
 	return 0;
+}
+
+int Gui::HelpTopicButtonAtLogical(int x, int y) const
+{
+	HelpGeom g = ComputeHelpGeom();
+	if (y < g.topic_btn_y || y >= g.topic_btn_y + g.btn_h) return -1;
+	for (int i = 0; i < kHelpTopicCount; ++i) {
+		int bx = g.topic_btn_x0 + i * (g.topic_btn_w + g.topic_btn_gap);
+		if (x >= bx && x < bx + g.topic_btn_w)
+			return kHelpTopics[i].page;
+	}
+	return -1;
 }
 
 bool Gui::PointInHelpPanel(int x, int y) const

@@ -61,6 +61,24 @@ public:
     // buffer (which is silence on a current Avery Lee build).
     bool UsingTap() const { return m_using_tap; }
 
+    // A/B audio path. Tap mode (default, prefer_tap=true):
+    //   - Pokey_SetMute(1)         - silence the DLL's native audio device
+    //   - Pokey_SetAudioTap(...)   - capture raw float samples ~64 kHz
+    //   - SDL plays the captured samples after a stereo-duplicate +
+    //     nearest-neighbour resample to 44.1 kHz.
+    // Native mode (prefer_tap=false, equivalent to RMT's legacy behaviour):
+    //   - Pokey_SetMute(0)         - let the DLL play through DirectSound/WASAPI
+    //   - Pokey_SetAudioTap(null)  - no tap.
+    //   - SDL submits the Pokey_Process buffer (which is 0x80 silence on
+    //     current Altirra builds), so the user hears only the DLL.
+    //
+    // Toggle live to A/B which path is responsible for any scratchiness.
+    // No-op if the patched DLL isn't loaded (HasAnalysisAbi() == false).
+    void SetUseAudioTap(bool prefer_tap);
+    bool PrefersTap() const { return m_prefer_tap; }
+    enum class AudioMode { Tap, Native };
+    AudioMode CurrentMode() const { return m_using_tap ? AudioMode::Tap : AudioMode::Native; }
+
     // Discard any tap samples queued while playback was paused. Call this
     // right before Resume() to keep the first frame after un-pause from
     // playing the stale audio that piled up during analysis.
@@ -89,13 +107,20 @@ private:
     // firing (it only stops the device from consuming the queued data),
     // so the engine could otherwise still get called during analysis.
     std::atomic<bool> m_paused { false };
-    bool m_using_tap = false;
+    bool m_using_tap = false;     // currently capturing (only true when patched DLL is loaded AND m_prefer_tap)
+    bool m_prefer_tap = true;     // user preference; default tap-on for the analysis-friendly path
     // Float samples captured from the Pokey audio tap, mix-rate (~64 kHz).
     // Callback() drains this into the SDL stream. Guarded because the tap
     // fires from whichever thread is driving the engine, which is *usually*
     // this SDL audio thread but could be the main thread during analysis.
     std::mutex        m_tap_mutex;
     std::vector<float> m_tap_buf;
+    // Fractional read position into m_tap_buf, carried across callbacks
+    // so the playback rate stays locked to engine_rate / host_rate (not
+    // to the snapshot-size / per-callback ratio, which would compress
+    // over-produced audio into the host window and play sharp + fast).
+    // Reset to 0 whenever TapPush drops the queue head on overflow.
+    double            m_resample_phase = 0.0;
     // 16 KB scratch buffer; heap-allocated to keep it off main's stack.
     std::vector<byte> m_scratch;
 };

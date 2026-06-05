@@ -10,6 +10,10 @@ struct Config {
     std::string library;     // Last instrument-library root folder
     std::string last_bank;   // Last saved/loaded bank path (.rmt or folder)
     int         last_file = 0; // Index into Directory::AllFiles()
+    // F12 audio-path toggle. true = tap mode (drain POKEY float stream
+    // into SDL), false = native mode (let the DLL play through its own
+    // audio device, RMT-style). See Audio::SetUseAudioTap.
+    bool        audio_tap = true;
 
     // Load from playrti.json beside the exe. Returns false if absent/unreadable
     // (fields keep their defaults).

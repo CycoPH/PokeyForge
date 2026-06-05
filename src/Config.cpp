@@ -116,6 +116,10 @@ bool Config::Load()
     if (FindValue(json, "last_file", val, is_str)) {
         last_file = std::atoi(val.c_str());
     }
+    if (FindValue(json, "audio_tap", val, is_str)) {
+        // Accept "true"/"false" or 0/1 to be lenient.
+        audio_tap = (val == "true" || val == "1");
+    }
     return true;
 }
 
@@ -126,7 +130,8 @@ bool Config::Save() const
     out << "{\n";
     out << "  \"library\": \""   << EscapeJson(library)   << "\",\n";
     out << "  \"last_bank\": \"" << EscapeJson(last_bank) << "\",\n";
-    out << "  \"last_file\": "   << last_file             << "\n";
+    out << "  \"last_file\": "   << last_file             << ",\n";
+    out << "  \"audio_tap\": "   << (audio_tap ? "true" : "false") << "\n";
     out << "}\n";
     return true;
 }

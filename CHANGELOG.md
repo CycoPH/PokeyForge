@@ -5,6 +5,45 @@ All notable changes to **PokeyForge** are tracked in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.3.1] - 2026-06-02
+
+### Fixed
+- **Scratchy / "too fast" playback in tap mode** (the F12 audio path
+  introduced in 1.3.0). The patched `sa_pokey.dll` ships with the same
+  `Pokey_Process` contract as upstream Altirra and Raster Music Tracker
+  (RMT): `Advance(sndn / 2)` ticks the POKEY scheduler, where `sndn` is
+  expected to be the **stereo 8-bit** byte count (i.e. `sample_pair * 2`),
+  so the engine advances exactly `sample_pair` ticks per call - matching
+  the configured playback rate in real time. RMT uses `CHANNELS = 2`
+  and matches this contract; **PokeyForge runs mono 8-bit**, so we were
+  passing `sndn = sample_count` and only ticking
+  `sample_count / 2` per call. The engine ran at *half* real time, the
+  audio tap under-fed by ~2x, and intermediate workarounds (a Generate
+  fill loop in `Audio::Callback`) over-corrected and made playback ~2x
+  *too fast*.
+
+  Fix: `Pokey::Process` now wraps the DLL call with an internal
+  `thread_local` 2x scratch buffer and passes `sndn = numSamples * 2`,
+  matching what RMT does. The engine ticks `numSamples` per call - real
+  time at 44.1 kHz - and the existing fixed-rate decimator in
+  `Audio::Callback` (`kStep = 63337 / 44100 ≈ 1.4357` tap samples per
+  host sample) drains the tap buffer at the correct pace with no
+  silence patches and no time compression. The Generate fill loop
+  introduced earlier as a band-aid is gone; one `Generate(want_frames)`
+  per callback is now exactly enough.
+
+  Verified against `D:\Projects\Atari8bit\Altirra-4.40-src` (the MFC
+  Altirra build that supplied the original `sa_pokey.dll` to RMT) -
+  its `rmtinterface.cpp` is identical to AltirraSDL's for everything
+  except the PokeyForge `SetAudioTap` / `SetMute` /
+  `GetAnalysisAbiVersion` exports we added, so the contract is the
+  same regardless of which Altirra source the DLL was built from. Tap
+  and native (F12) modes now sound pitch- and time-identical.
+
+### Documentation
+- CHANGELOG note above documenting the bug, the diagnosis (mono
+  vs stereo `sndn` semantics in the Altirra DLL), and the fix.
+
 ## [1.3.0] - 2026-06-02
 
 ### Added

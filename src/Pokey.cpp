@@ -2,6 +2,8 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 namespace {
 
@@ -91,7 +93,32 @@ void PutByte(std::uint16_t addr, std::uint8_t value)
 
 void Process(std::uint8_t* buffer, std::uint16_t numSamples)
 {
-    if (g_process) g_process((BYTE*)buffer, (WORD)numSamples);
+    if (!g_process) return;
+    // The DLL's Pokey_Process is designed for STEREO 8-bit: sndn = byte
+    // count = sample_pair_count * 2, and Advance(sndn / 2) advances by
+    // sample_pair_count ticks = real-time at the configured playback
+    // rate. RMT itself uses CHANNELS=2 and matches this contract.
+    //
+    // PokeyForge runs MONO, which would mean sndn = sample_count and
+    // Advance(sndn / 2) = sample_count / 2 ticks - HALF real-time. The
+    // engine then under-feeds the audio tap by ~2x, and earlier fixes
+    // that tried to make up the shortfall (a Generate fill loop) ended
+    // up over-driving the engine instead, making playback sound too
+    // fast. Compensate here by always passing the DLL twice our mono
+    // sample count (using an internal scratch buffer so the DLL's
+    // memset doesn't overflow the caller's mono-sized output).
+    //
+    // The DLL's behavior of memset'ing the buffer to 0x80 silence is
+    // unchanged; we throw those bytes away. The caller's `buffer` ends
+    // up populated with silence too (we copy back so the contract
+    // matches the legacy DLL's memset). The real audio comes off the
+    // audio tap (when installed) or the DLL's native audio device.
+    static thread_local std::vector<BYTE> stereo_scratch;
+    const size_t need = (size_t)numSamples * 2u;
+    if (stereo_scratch.size() < need) stereo_scratch.resize(need);
+    g_process(stereo_scratch.data(), (WORD)need);
+    if (buffer && numSamples > 0)
+        std::memcpy(buffer, stereo_scratch.data(), numSamples);
 }
 
 const char* About() { return g_about_text; }

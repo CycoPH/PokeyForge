@@ -20,7 +20,7 @@ on the Atari 8-bit. It lets you:
   pick up where you left off — PokeyForge remembers your last library and the last
   instrument you were on.
 
-![PokeyForge](screenshots/main.png)
+![PokeyForge main screen](screenshots/main.png)
 
 The sound is produced by the exact same emulation RMT itself uses (the Altirra
 POKEY and 6502 cores plus the RMT tracker driver), so what you hear in PokeyForge
@@ -95,8 +95,14 @@ is what you'll hear in RMT.
 
 **Standalone & self-contained**
 - Single Windows `.exe`, no installer and no MFC — built in **C++17 with SDL3**.
-- App icon, splash screen, in-app **About** and **F1 keybindings** overlay, and
-  friendly error dialogs.
+- App icon, splash screen, in-app **About** popup and **F1 help overlay** (15
+  topic pages: keybindings, analysis, search, clusters, spectral panel, editor),
+  and friendly error dialogs.
+- **`F12`** switches between two audio output paths: **TAP mode** (PokeyForge
+  drives an SDL3 audio stream directly from the engine's internal float samples)
+  and **NATIVE mode** (the patched POKEY DLL's own audio device plays back). Both
+  should sound identical in pitch and timing; TAP mode gives PokeyForge full
+  control of volume/gain.
 
 ---
 
@@ -170,12 +176,12 @@ the red cell cursor, its value and range, and what it does.
 
 | Panel | What it shows |
 |-------|---------------|
-| **Menu bar / header** | Clickable buttons — **Save (F2)**, **Load (F3)**, **Library (F4)**, **Analyse (F7)**, **About**, **Help (F1)** — plus status (PAL/NTSC clock, octave shift, bank fill count, `[EDIT]` / `MODIFIED`), and a small **live scope** in the top-right corner showing channel 1's waveform as it plays. |
+| **Menu bar / header** | Clickable buttons — **Save (F2)**, **Load (F3)**, **Library (F4)**, **Analyse (F7)**, **About**, **Help (F1)** — plus status (PAL/NTSC clock, octave shift, bank fill count, `[EDIT]` / `MODIFIED`), and a small **live scope** in the top-right corner showing channel 1's waveform as it plays. Buttons highlight on hover. |
 | **Search bar** (bottom of the right column) | Type-to-filter the instrument list by name (press `/` or click it). |
 | **Directory** (left) | The folder tree. `>` is a collapsed folder, `v` is expanded. The highlighted row is the instrument you're auditioning. A `B` next to a file means it's in your bank. Long names are shortened with a trailing `~`; the full filename always appears in the instrument header. |
 | **Instrument header** | The selected instrument's internal name, RTI version, ATA byte size, and the source **filename** (handy when the tree truncates it). |
 | **Parameters** | The instrument's 12 main parameters (table length/goto/speed/type/mode, envelope length/goto, volume fade/min, delay, vibrato, frequency shift) plus the 8 AUDCTL flag toggles. |
-| **Envelope** | The 8-row envelope grid (volume left/right, filter, command, distortion, portamento, X, Y) across each step. Brighter cells = higher values. A red marker shows the envelope's loop (goto) point. |
+| **Envelope** | The 6-row envelope grid across up to 16 steps: **VolR** and **VolL** (volume per channel, 0–15), **Dist** (POKEY distortion mode), **AUDCTL** (per-step AUDCTL modifier), **Filter/Port** (filter and portamento flags), and **Cmd** (envelope command). Brighter cells = higher values. A red marker shows the loop (goto) point. A **mini volume bar-graph** in the panel header gives a compact waveform overview; clicking it opens the **volume popup editor** (see below). |
 | **Note table** | The instrument's note/frequency table; the loop (goto) step is highlighted. |
 | **Bank** | Your 64 collected instruments as an 8×8 grid, each tile labelled `NN-name` (e.g. `00-kick`). Saved slots are green; **orange** slots are added/edited but not yet saved to disk; the slot holding the current instrument has a red border; the **selected** slot (for Ctrl operations) has a yellow outline. |
 | **Command bar** (bottom) | Quick reminders of the file/bank actions (`F2 Save`, `F3 Load`, `F4 Library`, the `Ctrl` bank verbs), the current library path, and transient confirmations like *"Saved drums.rmt + 12 .rti"*. |
@@ -301,9 +307,7 @@ In Edit mode:
 - The **focused panel** (Parameters, Envelope, Note table, or Name) gets a
   bright white frame, and a red cursor marks the exact cell you're changing. The
   **edit bar** at the bottom names the field, its value and range, and what it
-  does. The Envelope panel header also flips the `[EDITING - Tab to switch]`
-  hint into the top-right corner (next to the Mono/Stereo toggle), so the
-  mini volume graph in the centre stays unobstructed.
+  does.
 - `Tab` / `Shift+Tab` — move between the four panels.
 - Arrow keys — move the cell cursor.
 - `0`–`9`, `A`–`F` — type a value (two-digit fields compose); `+` / `-` nudge by
@@ -315,14 +319,6 @@ In Edit mode:
 - **Right-click** any binary field — an AUDCTL flag, the table type/mode, or an
   envelope filter/portamento cell — to flip it between 0 and 1 instantly,
   without typing. (Left-click any field to put the cursor there.)
-- **Mono ↔ Stereo toggle** in the Envelope panel header (and in the big
-  Vol popup's corner) flips the working instrument's encoding. In **mono**
-  any change to a `VolL` cell automatically mirrors to `VolR` and vice
-  versa — across hex-digit typing, `+` / `-` nudges, scroll-wheel
-  nudges, drag-paint, and the vol popup. The two channels stay locked
-  together until you switch to stereo. In **stereo** the channels are
-  independent; `↑` / `↓` buttons between the VolR and VolL sections of
-  the vol popup copy one channel onto the other in one undoable op.
 - Switching to a different instrument **exits Edit mode**, fully stops any
   ringing note, and silences the engine so the new instrument starts from a
   clean slate. New / loaded instruments default to **mono** regardless of
@@ -344,6 +340,59 @@ bank with `F2`.
 To save an edited instrument on its own (not via the bank), press `Ctrl+S` to
 **export it as a new `.RTI`** — a Save dialog lets you choose the name and
 location. The original file is left untouched.
+
+#### The envelope editor
+
+The Envelope panel is where most of an RMT instrument's character lives. Each
+column is one step that the POKEY driver advances through per frame; the driver
+loops back to the goto point until the note is released.
+
+![Envelope info](screenshots/envelope-info.png)
+![Envelope editor](screenshots/envelope_editor.png)
+
+
+**Rows (top to bottom):**
+
+| Row | Name | Range | What it does |
+|-----|------|-------|--------------|
+| 1 | **VolR** | 0–15 | Right-channel volume (or both channels in mono) |
+| 2 | **VolL** | 0–15 | Left-channel volume (independent in stereo mode) |
+| 3 | **Dist** | 0–15 | POKEY distortion/waveform mode for this step |
+| 4 | **AUDCTL** | 0–15 | Per-step AUDCTL register modifier |
+| 5 | **Filter/Port** | 0–1 | Filter flag (bit 0) and portamento flag (bit 1) |
+| 6 | **Cmd** | 0–15 | Envelope command (loop, end, etc.) |
+
+**Key controls in the Envelope panel:**
+
+- Click any cell to put the edit cursor there (enters Edit mode if not already
+  active). The edit bar below shows the field name, current value, and valid
+  range.
+- Drag across a row to paint a range of cells to the same value in one gesture.
+- Right-click a Filter/Port or binary field to toggle it instantly.
+- The **red triangle** marker above the grid shows `PAR_ENV_GOTO` — the column
+  the driver loops back to. Drag it left or right (or edit the goto column in
+  the Parameters panel).
+
+**Mono / Stereo toggle** (button in the envelope panel header):
+
+- **Mono** — VolR and VolL are locked together. Any edit to either row mirrors
+  automatically to the other, across all input methods (typing, nudge, drag,
+  volume popup). This is the default for newly loaded instruments.
+- **Stereo** — the two volume rows are fully independent. The volume popup shows
+  both sections with copy-between-channels `↑`/`↓` arrows.
+
+**Volume popup editor** — click the mini bar-graph in the envelope panel header
+(or click the VolR/VolL row label area) to open a large floating bar-chart editor
+for the two volume rows:
+
+- Each bar represents one envelope step's volume (0–15). Click or drag to set
+  values; the instrument updates live so you can hear the change.
+- A **Goto drag handle** at the bottom lets you slide the loop point without
+  leaving the popup.
+- The **Mono / Stereo toggle** in the popup's top-right corner mirrors the
+  panel-header toggle. In stereo mode, `↑` / `↓` arrows between the two
+  sections copy one row onto the other in one undoable operation.
+- Press `Esc` or click outside the popup to close it.
 
 ### Switching libraries
 
@@ -390,7 +439,7 @@ set of heuristics over its parameters, envelope, and note table; the checks
 fire in order and the first match wins, so a single instrument can only land
 in one bucket. The 15 buckets are: **Bass / Lead / Lead (vibrato) / Arp /
 Chord / Glide / Pad / Bell / Kick / Snare / HiHat / Perc / Swept FX /
-Noise / FX / Other**.
+Noise FX / Other**.
 
 Signals used:
 
@@ -419,7 +468,7 @@ Decision tree (top-down, first match wins):
     3. Non-noise distortion AND 2–5 columns → **Kick** (pulsey transient drum).
     4. Anything else short + fast → **Perc** (claps, woodblocks, generic blips).
 5. **Filter row sweeps (non-constant) AND not looping** → **Swept FX**.
-6. **Dominant noise distortion** (longer than a drum hit) → **Noise / FX**.
+6. **Dominant noise distortion** (longer than a drum hit) → **Noise FX**.
 7. **Envelope loops AND not fading quickly** → **Pad** (sustaining tones).
 8. **Pure-tone dominant AND vibrato non-zero** → **Lead (vibrato)**.
 9. **Pure-tone dominant** → **Lead**.
@@ -494,7 +543,7 @@ to turn the pane into a rainbow:
 | **HiHat** | Grey-pink |
 | **Perc** | Dusty rose |
 | **Swept FX** | Light blue-grey |
-| **Noise / FX** | Grey-blue |
+| **Noise FX** | Grey-blue |
 | **Other** / unanalysed | Default text grey |
 
 A row is **dimmed toward the panel background** when the classifier's
@@ -522,12 +571,14 @@ the widest raw range; k-means++ seeding keeps the result deterministic.
   expand or collapse just that cluster. The cluster around the current
   selection auto-expands so the highlighted row is never hidden under a
   collapsed header.
-- The number of clusters defaults to `ceil(sqrt(N/2))` clamped to **[3,
-  12]** — small libraries get 3 clusters, very large libraries cap at 12.
-- **`Ctrl+]`** / **`Ctrl+[`** override the cluster count for the *next*
-  analysis run (the notice bar shows the active value). Press **F7** to
-  re-analyse with the new k. **`Ctrl+] … Ctrl+[ … Ctrl+[`** back to 0
-  goes back to the automatic choice.
+- The cluster count **k** defaults to **24**, which produces useful
+  sub-groups on multi-thousand-instrument libraries. Setting k to **0**
+  switches to automatic sizing: `ceil(sqrt(N/2))` clamped to [3, 12].
+  The active value is persisted in `analysis.json` so it survives
+  across launches.
+- **`Ctrl+]`** / **`Ctrl+[`** step k up / down for the *next* analysis
+  run (the notice bar shows the current value). Press **F7** to
+  re-analyse with the new k. Step back to 0 to return to automatic sizing.
 
 **Cluster names.** k-means produces unlabelled groups (Cluster 1, Cluster
 2, ...). PokeyForge derives a short descriptive label from each cluster's
@@ -695,6 +746,8 @@ app.
 | `Ctrl+Z` / `Ctrl+Y` | Undo / redo the last edit |
 | `Ctrl+S` | Export the current instrument as a new `.RTI` file |
 | `Ctrl` + key | Audition the instrument being edited; `Space` replays |
+| **Mono/Stereo** button (Envelope header) | Toggle VolR↔VolL mirroring; also in the volume popup |
+| Click mini vol graph (Envelope header) | Open the large volume popup bar-chart editor |
 
 **Files & display**
 
@@ -714,6 +767,7 @@ app.
 | `Ctrl+]` / `Ctrl+[` | Increase / decrease the k-means cluster count (0 = auto) |
 | `@bright` in search | Filter by tag (combine with commas: `@bright,loud`) |
 | `F11` | Toggle fullscreen |
+| `F12` | Toggle audio output path: **TAP** (SDL3 stream, PokeyForge controls gain) ↔ **NATIVE** (POKEY DLL's own audio device) |
 | **About** button | Show the about / credits popup (any key or click closes it) |
 | Drag & drop | Drop a folder (open as library) or a `.RTI` (open its folder + select) onto the window |
 | Close window | Quit |
@@ -762,10 +816,13 @@ and internals.
   live audition and **undo/redo**; bank slot sampling and Ctrl bank operations;
   search, auto-categorisation, and duplicate detection; **directory scrollbar**
   with auto-expansion of the current selection's parent; **right-click context
-  menu** on bank slots (New / Clear / Export RTI / Import RTI) with hover
-  highlighting; right-click on a directory entry adds it to the bank (ATA-blob
-  deduplication); mouse wheel nudges edit fields when over the instrument
-  panels.
+  menus** on bank slots (New / Clear / Export RTI / Import RTI / Analyse) and
+  directory rows (Add to bank / Override category); ATA-blob deduplication on
+  add; mouse wheel nudges edit fields; **JetBrains Mono** font rendering via
+  SDL3_ttf; **volume popup bar-chart editor** with goto drag and mono/stereo
+  channel copy; **F12 TAP/NATIVE audio path toggle**; **15-page F1 help overlay**
+  with topic shortcut buttons; cluster view with descriptive names, hover
+  tooltips, and k=24 default; bank-wide Analyse button; manual category overrides.
 - **Possible future work:** stereo (8-channel) playback, multi-voice/chord
   audition, and selectable RMT driver versions.
 

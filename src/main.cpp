@@ -2202,6 +2202,10 @@ int main(int argc, char* argv[])
                       "sa_c6502.dll / sa_pokey.dll may be missing or incompatible.");
         return 1;
     }
+    // Apply the persisted audio-path preference BEFORE Open so the tap
+    // is installed (or not) in the first frame, not after a noticeable
+    // toggle visible to the user.
+    app.audio.SetUseAudioTap(config.audio_tap);
     if (!app.audio.Open(app.engine, kSampleRate)) {
         Fatal(window, std::string("Could not open the audio device:\n") + SDL_GetError());
         return 1;
@@ -2293,8 +2297,11 @@ int main(int argc, char* argv[])
                 SDL_ConvertEventToRenderCoordinates(renderer, &event);
                 int mx = (int)event.button.x;
                 int my = (int)event.button.y;
-                int dir = gui.HelpPageButtonAtLogical(mx, my);
-                if (dir != 0) {
+                int dir   = gui.HelpPageButtonAtLogical(mx, my);
+                int topic = gui.HelpTopicButtonAtLogical(mx, my);
+                if (topic >= 0) {
+                    app.help_page = topic;
+                } else if (dir != 0) {
                     app.help_page = (app.help_page + dir + Gui::kHelpPageCount)
                                     % Gui::kHelpPageCount;
                 } else if (!gui.PointInHelpPanel(mx, my)) {
@@ -2818,6 +2825,22 @@ int main(int argc, char* argv[])
                 continue;
             }
             if (k == SDLK_F11) { app.ToggleFullscreen(window); continue; }
+            // F12: A/B audio-path toggle. Tap mode (default) drains the
+            // engine's float-sample tap through SDL with a stereo
+            // duplicate + nearest-neighbour resample. Native mode lets the
+            // patched DLL's own DirectSound/WASAPI device play directly
+            // (same path RMT uses). Use it to A/B which path is
+            // responsible for any scratchiness in playback.
+            if (k == SDLK_F12) {
+                bool now_tap = !app.audio.PrefersTap();
+                app.audio.SetUseAudioTap(now_tap);
+                app.config.audio_tap = now_tap;
+                app.SaveConfig();
+                app.SetNotice(now_tap
+                    ? "Audio: TAP mode (SDL drains POKEY float stream)"
+                    : "Audio: NATIVE mode (DLL plays via its own audio device)");
+                continue;
+            }
             if (k == SDLK_F6)  {
                 app.editor.Toggle();
                 app.SetNotice(app.editor.active ? "Edit mode ON" : "Edit mode OFF (browsing)");

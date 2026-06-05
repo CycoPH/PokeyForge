@@ -106,10 +106,12 @@ struct GuiState {
 
 class Gui {
 public:
-    // Number of pages in the F1 help overlay (Keybindings, Categories &
-    // analysis, Search syntax, Clusters, Spectral panel, Editor). Exposed
-    // so the event loop can wrap Left/Right page navigation.
-    static constexpr int kHelpPageCount = 6;
+    // Number of pages in the F1 help overlay. Topics are split into
+    // smaller pages so each fits comfortably at TTF font sizes (the
+    // previous 6 dense pages overflowed once JetBrains Mono replaced
+    // the 8 px built-in font). Exposed so the event loop can wrap
+    // Left/Right page navigation.
+    static constexpr int kHelpPageCount = 15;
 
     // Attach a TextRenderer (must outlive this Gui).  Call before Render().
     void SetTextRenderer(TextRenderer* tr) { m_text_renderer = tr; }
@@ -119,8 +121,11 @@ public:
     // PointInHelpPanel is the dim-outside-dismiss test (clicks inside the
     // panel must NOT close help, otherwise users can't read it without
     // accidentally dismissing it).
-    int  HelpPageButtonAtLogical(int x, int y) const;
-    bool PointInHelpPanel       (int x, int y) const;
+    int  HelpPageButtonAtLogical (int x, int y) const;
+    // Returns the 0-based target page index for a topic shortcut button,
+    // or -1 if (x,y) is not over any topic button.
+    int  HelpTopicButtonAtLogical(int x, int y) const;
+    bool PointInHelpPanel        (int x, int y) const;
 
     void Render(SDL_Renderer* renderer, const GuiState& s);
 

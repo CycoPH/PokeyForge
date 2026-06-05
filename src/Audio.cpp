@@ -41,16 +41,22 @@ bool Audio::Open(RmtEngine& engine, int samplesPerSec)
         return false;
     }
 
-    // If the patched DLL is loaded, take over audio: silence the DLL's
-    // own native audio device and capture real samples through the tap so
-    // the SDL stream below has something to play. On a legacy DLL these
-    // calls are no-ops (HasAnalysisAbi() == false) and the callback falls
-    // back to whatever Pokey_Process writes into its byte buffer.
-    if (Pokey::HasAnalysisAbi()) {
+    // If the patched DLL is loaded AND tap mode is preferred, take over
+    // audio: silence the DLL's own native audio device and capture real
+    // samples through the tap so the SDL stream below has something to
+    // play. On a legacy DLL or with prefer_tap=false the DLL's own
+    // audio device handles playback; we still feed SDL (the Pokey_Process
+    // buffer is silent on current Altirra builds), which is the legacy
+    // RMT behaviour.
+    if (Pokey::HasAnalysisAbi() && m_prefer_tap) {
         Pokey::SetMute(true);
         Pokey::SetAudioTap(&Audio::TapThunk, this);
         m_using_tap = true;
     } else {
+        if (Pokey::HasAnalysisAbi()) {
+            Pokey::SetMute(false);
+            Pokey::SetAudioTap(nullptr, nullptr);
+        }
         m_using_tap = false;
     }
 
@@ -97,10 +103,12 @@ void Audio::Resume()
     if (m_stream) SDL_FlushAudioStream(m_stream);
     if (m_using_tap) Pokey::SetAudioTap(&Audio::TapThunk, this);
     // Anything that piled up during analysis would play out-of-context
-    // on the first frame back - drop it.
+    // on the first frame back - drop it and reset the read phase so
+    // playback starts clean at the next callback.
     {
         std::lock_guard<std::mutex> lock(m_tap_mutex);
         m_tap_buf.clear();
+        m_resample_phase = 0.0;
     }
     m_paused.store(false, std::memory_order_release);
     if (m_stream) SDL_ResumeAudioStreamDevice(m_stream);
@@ -109,6 +117,34 @@ void Audio::Resume()
 void Audio::SetGain(float gain)
 {
     if (m_stream) SDL_SetAudioStreamGain(m_stream, gain);
+}
+
+void Audio::SetUseAudioTap(bool prefer_tap)
+{
+    m_prefer_tap = prefer_tap;
+    if (!Pokey::HasAnalysisAbi()) {
+        // Legacy DLL: there is no choice to make, only the DLL's own
+        // audio device exists. Keep m_using_tap=false.
+        m_using_tap = false;
+        return;
+    }
+    if (prefer_tap && !m_using_tap) {
+        Pokey::SetMute(true);
+        Pokey::SetAudioTap(&Audio::TapThunk, this);
+        m_using_tap = true;
+        std::lock_guard<std::mutex> lock(m_tap_mutex);
+        m_tap_buf.clear();
+        m_resample_phase = 0.0;
+    } else if (!prefer_tap && m_using_tap) {
+        Pokey::SetAudioTap(nullptr, nullptr);
+        Pokey::SetMute(false);
+        m_using_tap = false;
+        // Any captured-but-unplayed samples are now noise; drop them so
+        // the next callback doesn't briefly mix stale audio in.
+        std::lock_guard<std::mutex> lock(m_tap_mutex);
+        m_tap_buf.clear();
+        m_resample_phase = 0.0;
+    }
 }
 
 void Audio::DropPendingTapAudio()
@@ -139,13 +175,16 @@ void Audio::TapPush(const float* left, std::uint32_t count)
     std::lock_guard<std::mutex> lock(m_tap_mutex);
     m_tap_buf.insert(m_tap_buf.end(), left, left + count);
     // Cap the queue at ~250 ms of mix-rate samples to bound memory if the
-    // SDL device stops pulling (paused, hung, etc). Keep the tail because
-    // it's the freshest audio - dropping the head loses old samples that
-    // would have played first but are no longer urgent.
+    // engine over-produces relative to host-rate consumption (it does -
+    // ~2.37 tap samples per host sample empirically vs the 1.4357 we
+    // consume for correct pitch). Drop the oldest half when over the cap
+    // and reset the read phase so the consumer doesn't dereference a
+    // freed position.
     constexpr size_t kMaxQueue = 16384;
     if (m_tap_buf.size() > kMaxQueue) {
         m_tap_buf.erase(m_tap_buf.begin(),
                         m_tap_buf.begin() + (m_tap_buf.size() - kMaxQueue / 2));
+        m_resample_phase = 0.0;
     }
 }
 
@@ -162,6 +201,12 @@ void Audio::Callback(SDL_AudioStream* stream, int additional_amount)
     // scratch buffer stays sized in bytes.
     int max_frames_per_chunk = (int)m_scratch.size() / bytes_per_frame;
 
+    // Engine-to-host resample ratio (PAL: ~1.4357 tap samples per host
+    // sample). Pre-computed here so the tap-mode fill loop and the
+    // resample stage agree on the target buffer level.
+    constexpr double kEngineRate_local = 1773447.0 / 28.0;
+    const double     kStep_local       = kEngineRate_local / (double)m_samples_per_sec;
+
     while (frames_needed > 0) {
         int want_frames = std::min(frames_needed, max_frames_per_chunk);
 
@@ -169,6 +214,14 @@ void Audio::Callback(SDL_AudioStream* stream, int additional_amount)
         // the buffer comes back as 0x80 silence (by design) - we only call
         // Generate to tick the POKEY scheduler so the audio tap fires.
         // On a legacy DLL the buffer holds the real mono audio.
+        //
+        // Pokey::Process passes sndn = 2 * numSamples to the DLL so each
+        // Generate(want_frames) advances the engine by exactly want_frames
+        // host samples of emulated time - matching real-time at the
+        // configured playback rate. With that fix one Generate per
+        // callback is the right amount; no fill loop needed (the old
+        // fill loop tried to compensate for half-rate engine advance and
+        // ended up over-driving 2-3x, making everything play too fast).
         int produced = m_engine->Generate(m_scratch.data(), want_frames);
         if (produced <= 0) {
             // Engine couldn't produce: feed silence so SDL doesn't underrun.
@@ -181,31 +234,60 @@ void Audio::Callback(SDL_AudioStream* stream, int additional_amount)
         std::vector<byte> stereo((size_t)produced * bytes_per_frame);
 
         if (m_using_tap) {
-            // Snapshot the tap queue under the lock, then resample it
-            // outside. Linear-rate nearest-neighbour decimation - audio
-            // is already at engine mix rate (~63 kHz); going to 44.1 kHz
-            // is a tiny down-sample, no audible artifacts.
-            std::vector<float> snapshot;
-            {
-                std::lock_guard<std::mutex> lock(m_tap_mutex);
-                snapshot.swap(m_tap_buf);
-            }
-            if (snapshot.empty()) {
-                std::memset(stereo.data(), 0x80, stereo.size());
-            } else {
-                const float ratio = (float)snapshot.size() / (float)produced;
-                for (int i = 0; i < produced; ++i) {
-                    int src = (int)(i * ratio);
-                    if (src < 0)                       src = 0;
-                    if (src >= (int)snapshot.size())   src = (int)snapshot.size() - 1;
-                    float v = snapshot[src];
-                    if (v < -1.0f) v = -1.0f;
-                    if (v >  1.0f) v =  1.0f;
-                    byte b = (byte)std::lround(128.0f + v * 127.0f);
-                    stereo[(size_t)i * 2 + 0] = b;
-                    stereo[(size_t)i * 2 + 1] = b;
+            // Resample the captured float stream into the host's U8 stereo
+            // output at the FIXED ratio engine_rate / host_rate. The
+            // previous code used ratio = snapshot.size() / produced,
+            // which compressed all of the engine's over-production into
+            // the per-callback host window and played ~1.6x too fast /
+            // an octave-ish too high. Keeping a fractional read phase
+            // across callbacks locks the playback to the engine's true
+            // emit rate; any surplus tap samples accumulate in the
+            // queue and are drained at the correct cadence (or dropped
+            // at the queue cap, see TapPush).
+            //
+            // Engine rate hardcoded to PAL (1773447 / 28) because
+            // Pokey_SoundInit in the patched DLL force-sets the
+            // reference clock to PAL regardless of what we pass in.
+            constexpr double kEngineRate = 1773447.0 / 28.0;  // ~63337 Hz
+            const double     kHostRate   = (double)m_samples_per_sec;
+            const double     kStep       = kEngineRate / kHostRate;   // ~1.4357
+
+            std::lock_guard<std::mutex> lock(m_tap_mutex);
+            const int sz = (int)m_tap_buf.size();
+            int last_consumed = -1;
+
+            for (int i = 0; i < produced; ++i) {
+                int src = (int)m_resample_phase;
+                if (src < 0 || src >= sz) {
+                    // Buffer underrun - engine hasn't produced enough yet.
+                    // Push silence; phase stays put so we resume cleanly.
+                    stereo[(size_t)i * 2 + 0] = 0x80;
+                    stereo[(size_t)i * 2 + 1] = 0x80;
+                    continue;
                 }
+                float v = m_tap_buf[src];
+                if (v < -1.0f) v = -1.0f;
+                if (v >  1.0f) v =  1.0f;
+                byte b = (byte)std::lround(128.0f + v * 127.0f);
+                stereo[(size_t)i * 2 + 0] = b;
+                stereo[(size_t)i * 2 + 1] = b;
+                m_resample_phase += kStep;
+                last_consumed = src;
             }
+
+            // Discard the samples we've fully consumed and rebase the phase
+            // so we don't unbounded-grow the vector head. The queue cap in
+            // TapPush handles the over-production case where this drain
+            // doesn't keep up.
+            int consumed = (int)m_resample_phase;
+            if (consumed >= sz) {
+                m_tap_buf.clear();
+                m_resample_phase = 0.0;
+            } else if (consumed > 0) {
+                m_tap_buf.erase(m_tap_buf.begin(), m_tap_buf.begin() + consumed);
+                m_resample_phase -= (double)consumed;
+            }
+            (void)last_consumed;
         } else {
             // Legacy path: m_scratch holds Pokey_Process's byte output.
             // Duplicate each mono sample to L+R so the audio is the same
