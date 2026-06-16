@@ -5,6 +5,113 @@ All notable changes to **PokeyForge** are tracked in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project uses [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-06-16
+
+### Added
+- **Song order panel** in the freed right half of the Parameters bar.
+  Shows the loaded `.rmt`'s song table decoded the same way RMT itself
+  decodes it (`CSong::AtaToSong`): walks the song bytes one at a time,
+  treats `255` (and other `>= 254` non-goto bytes) as empty `--` cells,
+  and renders `[254, target, lo, hi]` records as `GO TO LINE XX` in
+  accent colour. Multi-section modules (multiple goto-terminated
+  sub-songs concatenated) are rendered back-to-back instead of being
+  truncated at the first goto.
+- **Track view panel** sits to the right of the song order. Decodes the
+  selected track's event blob into the familiar RMT pattern grid
+  (`NN  C-3 II vV Fxx` per row) via a port of `CTracks::AtaToTrack`.
+  Title row shows `Track NN  ch N` plus `[<] [>]` step arrows and a
+  `len / go` summary on the right.
+- **Click-to-play in the track view.** Clicking a decoded note row
+  triggers that note on the POKEY voice the track was placed on. The
+  instrument and volume carry forward from earlier rows when the
+  clicked row has `--` for either (matches tracker-playback semantics).
+  The bank-panel cursor moves to the row's effective instrument slot
+  so the user can see which slot the row used. The editor's working
+  instrument is *not* swapped (use the bank panel for that).
+- **Click-to-select track in song order.** Clicking a track-index cell
+  in the song-order panel selects that track in the track view and
+  remembers which channel (POKEY voice) it was placed on, so a
+  subsequent click on a track-view row plays through that channel.
+- **Wheel scrolling on both panels.** Plain wheel scrolls rows within
+  the hovered panel; Ctrl+wheel anywhere on either panel steps the
+  selected track index.
+- **Title bar now shows the loaded bank file's full path.** Helps
+  distinguish multiple PokeyForge windows working on different banks.
+- **Bottom-bar hover hints** for the header Undo / Redo / Revert
+  buttons, the bank EDIT toggle, the bank Analyse button, and the
+  Envelope panel's Mono/Stereo toggle. Replaces the F-key hint strip
+  whenever the cursor is over one of those controls (a live transient
+  notice still wins).
+- **Ctrl+Alt+R** as the keyboard shortcut for "clear every manual
+  category override in the library at once." Shift+Ctrl+R (formerly
+  the clear-all shortcut) now cycles a single file's category
+  override - see *Changed* below for the rationale.
+
+### Changed
+- **Ctrl+letter always plays a note in browse mode.** Outside the bank
+  EDIT toggle, Ctrl+R no longer reclassifies; it plays the 'R' note
+  like every other Ctrl+letter audition key. The reclassify shortcuts
+  now require an extra modifier (Shift+Ctrl+R cycles one file,
+  Ctrl+Alt+R clears the library) so the audition ramp can't be
+  hijacked by a single-letter chord that's also the cycle-category
+  command. Updated F1 help + Readme to match.
+- **ENTER on the instrument-name panel commits + exits edit mode.**
+  Previously ENTER was a no-op on the Name panel; now it calls
+  `CommitToBank()` and drops out of the editor. The hex/envelope/
+  note-table panels still ignore ENTER (no meaningful gesture on a
+  hex cell).
+- **Parameters panel compacted to free room for the song view.**
+  Param column stride 220 -> 130, AUDCTL grid 4x2 -> 2x4 in a
+  taller-narrower block, and the "AUDCTL" caption rides on the same
+  header row as the "Parameters" section title. The button grid now
+  aligns vertically with the first param row (Tbl Len / Env Goto)
+  instead of starting one row lower. Net effect: the right ~50% of
+  the bar is free for the new song + track panels.
+
+### Fixed
+- **Bank metadata validator was too strict and silently rejected most
+  real `.rmt` files.** The previous gate required
+  `ptrTracksHi - ptrTracksLo == ptrSongData - ptrTracksHi` (the two
+  pointer-table sizes had to be equal). That's only true when no
+  track event blobs are inlined between the pointer tables and the
+  song region - never the case in RMT-exported modules, where the
+  packed track event data lives in that gap. As a result, the song
+  panel always showed "(song view disabled)" and round-trip Save was
+  silently downgraded to the silent-loop boilerplate.
+
+  Now: only require all four pointers to be inside the loaded block,
+  and treat `ptrTracksHi - ptrTracksLo` as the authoritative track
+  count. The two-tables-must-be-equal-size check is gone. Verified
+  against `connector26 with 3 songs.rmt` (a 3-section RMT module);
+  meta now loads cleanly and the song renders.
+- **Multi-section song truncation.** The song-region scanner stopped
+  at the first 254-goto, which meant only the first sub-song of a
+  multi-section module was captured (typically just an empty row plus
+  the goto). The whole region from `ptrSongData` to `blockEnd` is now
+  captured verbatim, matching what RMT's `CSong::AtaToSong` reads;
+  multi-section modules render every sub-song.
+- **Song-order row highlight no longer overdraws the row above.** The
+  highlight rectangle was painted at `ry - 1, height = row_h`, which
+  bled into the previous row's glyph descenders. Now `ry + 2,
+  height = row_h - 2`, sitting cleanly inside the current row's slot.
+- **Track-view arrow buttons were a little small.** Bumped from 14x14
+  to 20x20 so they match the title-row text height and don't look
+  cramped next to "Track NN  ch N".
+- **Inserting / saving still updated the window title.** The new
+  full-path title in the title bar is refreshed by `LoadBankDialog`,
+  `SaveBankDialog`, and the startup auto-reload, so opening or
+  saving a bank from any path keeps the title in sync.
+
+### Internal
+- New `Bank::RmtSource()` accessor exposes the captured
+  `RmtModuleMeta` to the GUI. New `fail_reason` field on the meta
+  surfaces the rejection cause directly in the song-order panel
+  (instead of just stderr) so failures aren't silent.
+- `Bank::RmtModuleMeta::song_data` now holds the full song region
+  (not just one sub-song). The `song_goto_target_off` field stays
+  as a best-effort hint for the single-section round-trip path -
+  multi-section round-trip is left as future work.
+
 ## [1.3.1] - 2026-06-02
 
 ### Fixed

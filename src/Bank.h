@@ -52,6 +52,41 @@ public:
         std::uint64_t cluster_hash = 0;
     };
 
+    // Captured-at-load metadata from a source .rmt module. Lets SaveRmt
+    // rebuild the host module (preserving song, tracks, channel count,
+    // speeds, song name) instead of emitting a fresh silent loop.
+    //
+    // `valid` is false when the bank was built from scratch or loaded
+    // from a manifest folder - SaveRmt then falls back to the silent
+    // -loop boilerplate. `valid` is also false after a partial / failed
+    // LoadFromRmt: the bank still gets the instruments (no regression
+    // vs the legacy behaviour) but SaveRmt won't try to round-trip a
+    // module we couldn't fully parse.
+    //
+    // tracks[i] holds track i's event blob verbatim. song_data holds
+    // the full song-table byte stream INCLUDING the trailing 254-goto
+    // record (last 2 bytes = goto-target pointer, patched at save time
+    // to the new song-data base + song_goto_target_off).
+    struct RmtModuleMeta {
+        bool        valid             = false;
+        int         base_addr         = 0x4000;
+        int         num_instr_source  = 0;     // instrument count from source
+        int         num_tracks        = 0;
+        byte        channels          = '4';
+        byte        track_len         = 64;
+        byte        song_speed        = 6;
+        byte        instr_speed       = 1;
+        byte        format_ver        = 1;
+        std::string song_name;                 // unterminated
+        std::vector<std::vector<byte>> tracks; // per-track event blob
+        std::vector<byte>              song_data;
+        int  song_goto_target_off     = 0;     // orig goto target - orig ptrSongData
+        // Diagnostic: when `valid` is false, why the loader rejected the file.
+        // The GUI shows this in the Song order panel so the user can see
+        // exactly why no song is rendered.
+        std::string fail_reason;
+    };
+
     Bank();
 
     int  FirstEmptySlot() const;     // -1 if full
@@ -118,6 +153,19 @@ public:
     // when exporting.
     int  HighestUsedPlusOne() const;
 
+    // Captured RMT source metadata. Only meaningful when `valid` is true on
+    // the returned struct (i.e. the bank came from a real .rmt module).
+    // Read-only; the GUI uses it to render the song order list / track list.
+    const RmtModuleMeta& RmtSource() const { return m_rmt_source; }
+
 private:
+    // Internal SaveRmt branches. SaveRmt() picks one based on
+    // m_rmt_source.valid. Silent emits the legacy hand-built silent-loop
+    // module; RoundTrip rebuilds the host module from m_rmt_source with
+    // current bank slots as the instrument payload.
+    bool SaveRmtSilent   (const std::string& rmt_path) const;
+    bool SaveRmtRoundTrip(const std::string& rmt_path) const;
+
     std::array<Slot, SLOT_COUNT> m_slots;
+    RmtModuleMeta                m_rmt_source;
 };

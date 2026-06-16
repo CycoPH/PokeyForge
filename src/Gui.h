@@ -271,6 +271,59 @@ public:
     // True when (x,y) is over the Mono/Stereo toggle button inside the vol popup.
     bool PointInVolPopupStereoToggle(int x, int y) const;
 
+    // Song order panel: middle column of the Parameters bar. Shows the
+    // loaded .rmt's song-order list (one row per line, 4 track indices
+    // per line). The wheel scrolls rows; Ctrl+wheel steps the selected
+    // track index (shown in the track view next to it).
+    bool PointInSongOrder(int x, int y) const;
+    void ScrollSongOrder(int notches, bool ctrl, const GuiState& s);
+
+    // Song-order cell hit-test. Returns the (track, channel) pair displayed
+    // in the clicked cell: `track` is the track index from the song line,
+    // `channel` is the column (0..3 for 4-channel, 0..7 for 8-channel)
+    // which IS the POKEY voice the track plays on. track < 0 when the
+    // cell isn't a real track ref (goto-line, empty cell, off-panel).
+    struct SongCellHit { int track = -1; int channel = -1; };
+    SongCellHit SongCellAt(int x, int y, const GuiState& s) const;
+
+    // Select a track index directly (resets the track-view scroll). If
+    // `channel` >= 0, also records which song channel the track was
+    // picked from so subsequent track-row clicks play on that voice.
+    void SelectTrack(int track_index, const GuiState& s, int channel = -1);
+
+    // The POKEY voice the currently-displayed track was selected from.
+    // 0 by default (when the user picked the track via the arrow buttons
+    // or Ctrl+wheel rather than clicking a song cell).
+    int SelectedChannel() const { return m_song_channel; }
+
+    // Track view panel: right column of the Parameters bar. Decoded
+    // RMT pattern of the track selected by m_song_track, with inline
+    // [<] [>] arrows on the title row.
+    //   PointInTrackView   : true when (x,y) is anywhere over the panel.
+    //   TrackArrowAt       : returns -1 for [<], +1 for [>], 0 for neither.
+    //   ScrollTrackView    : plain wheel scrolls rows; ctrl steps tracks.
+    bool PointInTrackView(int x, int y) const;
+    int  TrackArrowAt    (int x, int y) const;
+    void ScrollTrackView (int notches, bool ctrl, const GuiState& s);
+    void StepTrack       (int delta, const GuiState& s);
+
+    // Track row hit-test. Returns the absolute row index (0..track_len-1)
+    // when (x,y) is over a decoded note row in the track view, or -1.
+    // Filled-in `note` / `instr` / `vol` carry the effective values at
+    // that row, with -1 carried forward from earlier rows (matching
+    // tracker playback semantics) when the row itself doesn't specify
+    // a value. note < 0 means the row has no playable note at all.
+    struct TrackRowHit {
+        int row   = -1;
+        int note  = -1;
+        int instr = -1;
+        int vol   = -1;
+    };
+    TrackRowHit TrackRowAt(int x, int y, const GuiState& s) const;
+
+    // Current track index the user is previewing (for app-side callbacks).
+    int SelectedTrack() const { return m_song_track; }
+
 private:
     void DrawHeader(SDL_Renderer* r, const GuiState& s);
     void DrawTree  (SDL_Renderer* r, const GuiState& s);
@@ -279,6 +332,8 @@ private:
     void DrawEnvelope  (SDL_Renderer* r, const GuiState& s);
     void DrawNoteTable (SDL_Renderer* r, const GuiState& s);
     void DrawBank      (SDL_Renderer* r, const GuiState& s);
+    void DrawSongOrder (SDL_Renderer* r, const GuiState& s);
+    void DrawTrackView (SDL_Renderer* r, const GuiState& s);
     void DrawCommandBar(SDL_Renderer* r, const GuiState& s);
     void DrawEditBar(SDL_Renderer* r, const GuiState& s);
     void DrawSearchBar(SDL_Renderer* r, const GuiState& s);
@@ -319,6 +374,17 @@ private:
     // Volume bar-graph popup state.
     bool m_vol_popup_open = false;
     bool m_vol_goto_drag  = false;
+
+    // Song order panel state.
+    // m_song_scroll  : top visible row in the order list.
+    // m_song_track   : track index the user is previewing.
+    // m_song_channel : POKEY voice (0..3 / 0..7) the track was picked from,
+    //                  so a click on a track-row note plays on that voice.
+    // m_track_scroll : top visible row in the decoded track view.
+    int m_song_scroll  = 0;
+    int m_song_track   = 0;
+    int m_song_channel = 0;
+    int m_track_scroll = 0;
 
     // Optional TTF text renderer; nullptr = use debug font fallback.
     TextRenderer* m_text_renderer = nullptr;

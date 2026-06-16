@@ -623,10 +623,12 @@ you can override it without re-running analysis:
 - **Right-click any directory file** → **Override category ▸** opens a
   colour-coded picker listing every category plus a *Clear override
   (auto)* row.
-- **`Ctrl+R`** on the current file cycles its category through every value
-  and then back to "use auto" — fast when you're flipping a few files
-  without leaving the keyboard.
-- **`Ctrl+Shift+R`** clears every manual override in the library at once
+- **`Shift+Ctrl+R`** on the current file cycles its category through every
+  value and then back to "use auto" — fast when you're flipping a few
+  files without leaving the keyboard. (Plain `Ctrl+R` is reserved for the
+  audition ramp — it plays the 'R' note like the other `Ctrl+letter`
+  keys.)
+- **`Ctrl+Alt+R`** clears every manual override in the library at once
   (with the count shown in the notice bar — there's no confirm, but
   setting overrides again is trivial).
 
@@ -727,9 +729,9 @@ app.
 | `Ctrl+Del` | Delete the selected slot (confirm) |
 | Right-click a slot | Context menu: New / Clear / Export RTI / Import RTI / **Analyse** |
 | **Analyse** button (bank title) | Bank-wide cluster fingerprint pass (every used slot in one go) |
-| **EDIT** button (bank panel) | Toggle bank-edit: when on, `Ctrl+C/X/V/Y/S` edit; when off they play |
+| **EDIT** button (bank panel) | Toggle bank-edit: when on, `Ctrl+Z/C/X/V/Y/S` edit; when off they play |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | (EDIT on) copy / cut / paste a bank slot (cut + paste = move/reorder) |
-| `Ctrl+Y` / `Ctrl+S` | (EDIT on) Redo / Export current instrument; outside EDIT they play |
+| `Ctrl+Z` / `Ctrl+Y` / `Ctrl+S` | (EDIT on) Undo / Redo / Export current instrument; outside EDIT they play |
 
 **Editing** (`F6` to toggle Edit mode)
 
@@ -762,8 +764,8 @@ app.
 | `F8` | Toggle folder view / group-by-category |
 | `F9` | Show / hide duplicate instruments |
 | `F10` | Toggle Clusters view (k-means group-by-similarity) |
-| `Ctrl+R` | Reclassify the current file - cycle its manual override |
-| `Ctrl+Shift+R` | Clear every manual override in the library |
+| `Shift+Ctrl+R` | Reclassify the current file - cycle its manual override |
+| `Ctrl+Alt+R` | Clear every manual override in the library |
 | `Ctrl+]` / `Ctrl+[` | Increase / decrease the k-means cluster count (0 = auto) |
 | `@bright` in search | Filter by tag (combine with commas: `@bright,loud`) |
 | `F11` | Toggle fullscreen |

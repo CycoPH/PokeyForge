@@ -304,19 +304,54 @@ when committing edits).
 Filename sanitisation replaces characters illegal on Windows and trims trailing
 dots/spaces.
 
-**`SaveRmt(path)`** — single `.RMT` module (see §10 for the format). The bank's
-stored ATA blobs are emitted directly into the instrument data area, so no
+**`SaveRmt(path)`** — single `.RMT` module (see §9a for the format). Two
+paths, picked by whether the bank was loaded from a `.rmt` source:
+
+- **Round-trip path** (`m_rmt_source.valid == true`): rebuilds the source
+  module's first block with current bank slots substituted into the
+  instrument-pointer table. Preserves the original song, tracks, channel
+  count, header speeds, song name, and goto target. Instrument count grows
+  to fit any added slots; never shrinks below the source count, so the
+  song's instrument-index references in track data stay valid (removed
+  slots get a zero pointer — RMT silences those notes). Instrument names
+  follow the user's current bank-slot names.
+- **Silent-loop fallback** (`m_rmt_source.valid == false`): hand-built
+  module with 4 channels, one 64-line empty pause track, a one-line song
+  looping forever, and song name `"PokeyForge Bank"`. Used when the bank
+  was built from scratch or loaded from a manifest folder.
+
+ATA blobs are emitted directly into the instrument data area, so no
 re-encoding is needed.
 
 **`LoadFromManifest(folder_or_manifest)`** — clears the bank, reads
 `manifest.txt`, and reloads each referenced `.RTI` (falling back to the
 `NN_*.rti` file beside the manifest if the recorded source path is gone).
+Leaves `m_rmt_source.valid` cleared, so a subsequent `SaveRmt` takes the
+silent-loop path.
 
-**`LoadFromRmt(path)`** — clears the bank, parses the RMT module's first block,
-walks the instrument-pointer table, and copies each instrument's ATA blob into
-the matching slot. Blob length is recovered from the blob's own header
-(`blob[2] + 3`, the envelope-end pointer plus the final 3-byte column). Names
-come from the module's second (names) block.
+**`LoadFromRmt(path)`** — clears the bank, parses the RMT module's first
+block, walks the instrument-pointer table, and copies each instrument's
+ATA blob into the matching slot. Blob length is recovered from the blob's
+own header (`blob[2] + 3`, the envelope-end pointer plus the final 3-byte
+column). Names come from the module's second (names) block.
+
+In addition, captures `RmtModuleMeta` for round-trip on save: header
+config bytes 3–7 (channels, track length, song/instrument speeds, format
+version), the song name, each track's event blob (sliced using a sorted
+boundary set of `{ track pointers, ptrSongData, blockEnd, instrument
+pointers }`), and the song-data byte stream up through its first 254-goto
+record. Stored on `m_rmt_source`; reset to defaults by `Clear()`. Known
+limitations:
+
+- Tracks are sliced contiguously; over-reads into trailing zeros are
+  silently terminated by RMT's track interpreter.
+- The song scan stops at the first 254-goto row. Multi-section modules
+  with additional sub-songs lose everything past that point; a warning
+  is logged to stderr.
+- Validation failures (out-of-range pointers, track-table size
+  disagreement, missing 254-goto) leave `m_rmt_source.valid = false`,
+  so the bank still loads its instruments but SaveRmt falls back to
+  silent-loop.
 
 The UI keeps a **bank cursor** (selected slot). The mouse sets it via
 `Gui::BankSlotAtLogical` (logical-coordinate hit-test that shares geometry with
@@ -344,36 +379,49 @@ decoding its blob via an in-memory `.RTI` wrapper.
 
 ## 9a. The `.RMT` module format (export/import)
 
-A `.RMT` file is **two Atari binary blocks** (§4). PokeyForge writes a module
-targeted at `$4000`.
+A `.RMT` file is **two Atari binary blocks** (§4). PokeyForge's silent-loop
+export targets `$4000`; the round-trip export preserves whatever load
+address the source module used.
 
 **Block 1 — the module.** 16-byte header:
 
 | Offset | Bytes | Meaning |
 |-------:|------:|---------|
 | 0 | 3 | `"RMT"` |
-| 3 | 1 | channel count: `'4'` (PokeyForge always exports 4-channel) |
-| 4 | 1 | track length (PokeyForge uses 64) |
-| 5 | 1 | song speed (PokeyForge uses 6) |
-| 6 | 1 | instrument speed (PokeyForge uses 1) |
+| 3 | 1 | channel count: `'4'` for mono, `'8'` for stereo |
+| 4 | 1 | track length (PokeyForge silent path uses 64; round-trip preserves source) |
+| 5 | 1 | song speed (silent: 6; round-trip: from source) |
+| 6 | 1 | instrument speed (silent: 1; round-trip: from source) |
 | 7 | 1 | RMT format version (1) |
 | 8–9 | 2 | pointer to instrument table |
 | 10–11 | 2 | pointer to track low-byte table |
 | 12–13 | 2 | pointer to track high-byte table |
 | 14–15 | 2 | pointer to song data |
 
-Then: the instrument-pointer table (`numInstruments × 2`, little-endian; `0`
-for empty slots), the track tables, the instrument ATA blobs, one **empty
-track** (`{62, 64}` = a 64-beat pause), and a **song** of one line referencing
-track 0 on all channels followed by a `254`-goto looping to line 0. The result
-is a valid, silent, looping module whose only real payload is the instruments.
+**Silent-loop layout** (used when no source `.rmt` was captured): the
+instrument-pointer table (`numInstruments × 2`, little-endian; `0` for
+empty slots), the track tables, the instrument ATA blobs, one empty track
+(`{62, 64}` = a 64-beat pause), and a song of one line referencing track 0
+on all channels followed by a `254`-goto looping to line 0. The result is a
+valid, silent, looping module whose only real payload is the instruments.
 
-**Block 2 — names.** The song name (`"PokeyForge Bank"`, zero-terminated) followed
-by each used instrument's name (zero-terminated, in slot order).
+**Round-trip layout** (used when `m_rmt_source.valid == true`): header
+copied from source (bytes 3–7), instrument-pointer table sized to
+`max(source_count, current_highest_used+1)`, tracks_lo / tracks_hi tables
+sized to `source.num_tracks`, then the captured song data verbatim (with
+its trailing 254-goto target re-pointed at the new song base), then each
+captured track's event blob (pointers recorded back into tracks_lo/hi),
+then each used slot's current ATA blob (pointers recorded into the
+instrument table).
 
-Import (`LoadFromRmt`) reverses this: it reads block 1 into a 64K image, derives
-`numInstruments` from `(trackLoPtr − instrPtr) / 2`, and extracts each non-zero
-instrument pointer's blob.
+**Block 2 — names.** The song name (silent: `"PokeyForge Bank"`;
+round-trip: from source) followed by each used instrument's name
+(zero-terminated, in slot order — names follow user edits in both paths).
+
+Import (`LoadFromRmt`) reverses this: it reads block 1 into a 64K image,
+derives `numInstruments` from `(trackLoPtr − instrPtr) / 2`, and extracts
+each non-zero instrument pointer's blob. See §9's `LoadFromRmt` description
+for the metadata it also captures for round-trip.
 
 ---
 

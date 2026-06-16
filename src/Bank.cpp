@@ -133,6 +133,11 @@ bool Bank::RemoveByPath(const std::string& path)
 void Bank::Clear()
 {
     for (auto& s : m_slots) s = Slot{};
+    // Drop any captured source-RMT metadata so a subsequent SaveRmt falls
+    // back to the silent-loop boilerplate. LoadFromRmt repopulates this
+    // after calling Clear(); LoadFromManifest leaves it cleared (manifest
+    // folders have no source song to preserve).
+    m_rmt_source = RmtModuleMeta{};
 }
 
 int Bank::UsedCount() const
@@ -269,6 +274,16 @@ void WriteBinaryBlock(std::ofstream& out, const std::vector<byte>& mem,
 
 bool Bank::SaveRmt(const std::string& rmt_path) const
 {
+    // Round-trip the source module when one was captured at load time,
+    // so songs/tracks/header config survive an edit-and-save cycle.
+    // Otherwise emit the hand-built silent-loop module (legacy behaviour
+    // for banks built from scratch or loaded from a manifest folder).
+    if (m_rmt_source.valid) return SaveRmtRoundTrip(rmt_path);
+    return SaveRmtSilent(rmt_path);
+}
+
+bool Bank::SaveRmtSilent(const std::string& rmt_path) const
+{
     const int addr = 0x4000;
     const int numInstr  = HighestUsedPlusOne();
     const int numTracks = 1;
@@ -339,6 +354,132 @@ bool Bank::SaveRmt(const std::string& rmt_path) const
             std::memcpy(mem.data() + nameAddr, nm.c_str(), len);
             nameAddr += len;
         }
+    }
+
+    std::ofstream out(rmt_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        std::fprintf(stderr, "Bank::SaveRmt: cannot create %s\n", rmt_path.c_str());
+        return false;
+    }
+    WriteBinaryBlock(out, mem, addr, endOfModule - 1, /*with_header=*/true);
+    WriteBinaryBlock(out, mem, namesStart, nameAddr - 1, /*with_header=*/false);
+    return true;
+}
+
+bool Bank::SaveRmtRoundTrip(const std::string& rmt_path) const
+{
+    // Rebuild the source module's first block with current bank slots
+    // plugged into the instrument-pointer table. Song, tracks, header
+    // metadata, and song name all come from m_rmt_source (captured at
+    // LoadFromRmt time). The instrument count grows to fit any new bank
+    // slots but never shrinks below the source count - the song's
+    // instrument-index references in track data must stay valid; removed
+    // slots get a zero pointer (RMT silences those notes).
+    const int addr      = m_rmt_source.base_addr;
+    const int numInstr  = std::max(m_rmt_source.num_instr_source,
+                                   HighestUsedPlusOne());
+    const int numTracks = m_rmt_source.num_tracks;
+
+    std::vector<byte> mem(0x10000, 0);
+
+    const int ptrInstruments = addr + 16;
+    const int ptrTracksLo    = ptrInstruments + numInstr * 2;
+    const int ptrTracksHi    = ptrTracksLo + numTracks;
+    const int ptrSongData    = ptrTracksHi + numTracks;
+
+    // 1. Song data verbatim. The trailing 4 bytes are the 254-goto
+    //    record [254, line, lo, hi]; lo/hi point at the loop target
+    //    inside the original song region, so we re-point them at the
+    //    new song base + the captured relative offset.
+    const int songLen = (int)m_rmt_source.song_data.size();
+    if (ptrSongData + songLen > 0x10000) {
+        std::fprintf(stderr, "Bank::SaveRmt: module would exceed 64 KiB (song)\n");
+        return false;
+    }
+    std::memcpy(mem.data() + ptrSongData,
+                m_rmt_source.song_data.data(), songLen);
+    if (songLen >= 4) {
+        const int newGotoTarget = ptrSongData + m_rmt_source.song_goto_target_off;
+        const int gotoLoOffset  = ptrSongData + songLen - 2;
+        PutWord(mem, gotoLoOffset, newGotoTarget);
+    }
+    int cursor = ptrSongData + songLen;
+
+    // 2. Track event blobs, each track's new pointer recorded in
+    //    tracks_lo / tracks_hi. Empty captured tracks write a 0 pointer
+    //    (matches LoadFromRmt's handling of zero pointers).
+    for (int i = 0; i < numTracks; ++i) {
+        const auto& blob = m_rmt_source.tracks[i];
+        if (blob.empty()) {
+            mem[ptrTracksLo + i] = 0;
+            mem[ptrTracksHi + i] = 0;
+            continue;
+        }
+        if (cursor + (int)blob.size() > 0x10000) {
+            std::fprintf(stderr, "Bank::SaveRmt: module would exceed 64 KiB (track %d)\n", i);
+            return false;
+        }
+        std::memcpy(mem.data() + cursor, blob.data(), blob.size());
+        mem[ptrTracksLo + i] = (byte)(cursor & 0xFF);
+        mem[ptrTracksHi + i] = (byte)((cursor >> 8) & 0xFF);
+        cursor += (int)blob.size();
+    }
+
+    // 3. Instrument ATA blobs. Used slots get a real pointer; unused
+    //    slots (including holes the user opened up since load) get 0.
+    for (int i = 0; i < numInstr; ++i) {
+        const Slot& s = m_slots[i];
+        if (s.used && !s.ata.empty()) {
+            if (cursor + (int)s.ata.size() > 0x10000) {
+                std::fprintf(stderr, "Bank::SaveRmt: module would exceed 64 KiB (instr %d)\n", i);
+                return false;
+            }
+            PutWord(mem, ptrInstruments + i * 2, cursor);
+            std::memcpy(mem.data() + cursor, s.ata.data(), s.ata.size());
+            cursor += (int)s.ata.size();
+        } else {
+            PutWord(mem, ptrInstruments + i * 2, 0);
+        }
+    }
+
+    const int endOfModule = cursor;
+
+    // 4. Header. Bytes 3-7 preserved from source; pointers reflect new
+    //    layout. Magic is always "RMT".
+    mem[addr + 0] = 'R'; mem[addr + 1] = 'M'; mem[addr + 2] = 'T';
+    mem[addr + 3] = m_rmt_source.channels;
+    mem[addr + 4] = m_rmt_source.track_len;
+    mem[addr + 5] = m_rmt_source.song_speed;
+    mem[addr + 6] = m_rmt_source.instr_speed;
+    mem[addr + 7] = m_rmt_source.format_ver;
+    PutWord(mem, addr + 8,  ptrInstruments);
+    PutWord(mem, addr + 10, ptrTracksLo);
+    PutWord(mem, addr + 12, ptrTracksHi);
+    PutWord(mem, addr + 14, ptrSongData);
+
+    // 5. Names block: source song name (or fallback) then per-used-slot
+    //    name in slot order. Empty slots are skipped - matches the
+    //    LoadFromRmt parser which assigns names to used slots only.
+    int nameAddr = endOfModule;
+    const int namesStart = nameAddr;
+    const std::string songName =
+        m_rmt_source.song_name.empty() ? std::string("PokeyForge Bank")
+                                       : m_rmt_source.song_name;
+    if (nameAddr + (int)songName.size() + 1 > 0x10000) {
+        std::fprintf(stderr, "Bank::SaveRmt: module would exceed 64 KiB (song name)\n");
+        return false;
+    }
+    std::memcpy(mem.data() + nameAddr, songName.c_str(), songName.size() + 1);
+    nameAddr += (int)songName.size() + 1;
+    for (int i = 0; i < numInstr; ++i) {
+        if (!m_slots[i].used) continue;
+        const std::string& nm = m_slots[i].name;
+        if (nameAddr + (int)nm.size() + 1 > 0x10000) {
+            std::fprintf(stderr, "Bank::SaveRmt: module would exceed 64 KiB (instr names)\n");
+            return false;
+        }
+        std::memcpy(mem.data() + nameAddr, nm.c_str(), nm.size() + 1);
+        nameAddr += (int)nm.size() + 1;
     }
 
     std::ofstream out(rmt_path, std::ios::binary | std::ios::trunc);
@@ -469,15 +610,20 @@ int Bank::LoadFromRmt(const std::string& rmt_path)
     int addr = from;
     if (mem[addr] != 'R' || mem[addr + 1] != 'M' || mem[addr + 2] != 'T') return -1;
 
-    int ptrInstruments = mem[addr + 8] | (mem[addr + 9] << 8);
+    int ptrInstruments = mem[addr + 8]  | (mem[addr + 9]  << 8);
+    int ptrTracksLo    = mem[addr + 10] | (mem[addr + 11] << 8);
+    int ptrTracksHi    = mem[addr + 12] | (mem[addr + 13] << 8);
+    int ptrSongData    = mem[addr + 14] | (mem[addr + 15] << 8);
     // Number of instruments = entries until the track-lo table.
-    int ptrTracksLo = mem[addr + 10] | (mem[addr + 11] << 8);
     int numInstr = (ptrTracksLo - ptrInstruments) / 2;
     if (numInstr < 0) numInstr = 0;
     if (numInstr > SLOT_COUNT) numInstr = SLOT_COUNT;
 
-    // Second block: names (song name then instrument names).
+    // Second block: names (song name then instrument names). Capture the
+    // song name so SaveRmt can preserve it on round-trip; the previous
+    // code skipped past it.
     size_t namesStart = p + blockLen;
+    std::string songName;
     std::vector<std::string> names;
     if (namesStart + 4 <= file.size()) {
         size_t q = namesStart;
@@ -489,8 +635,8 @@ int Bank::LoadFromRmt(const std::string& rmt_path)
             const byte* nm = file.data() + q;
             int nlen = nt - nf + 1;
             int idx = 0;
-            // Skip song name.
-            while (idx < nlen && nm[idx]) ++idx;
+            // Song name comes first.
+            while (idx < nlen && nm[idx]) songName += (char)nm[idx++];
             ++idx;
             while (idx < nlen) {
                 std::string s;
@@ -521,6 +667,131 @@ int Bank::LoadFromRmt(const std::string& rmt_path)
         s.source_path.clear();
         ++nameCursor;
         ++loaded;
+    }
+
+    // ----- Capture source-module metadata for SaveRmt round-trip ---------
+    //
+    // Validate the header pointers, slice each track's event blob, and
+    // scan the song table for its 254-goto terminator. On any failure
+    // we leave m_rmt_source.valid = false (Clear() ran above, so the
+    // default value is already in place) and SaveRmt falls back to the
+    // legacy silent-loop path - no regression vs the pre-round-trip
+    // behaviour.
+    const int blockEnd = addr + (int)blockLen;
+    auto ptrInBlock = [&](int q) { return q >= addr && q < blockEnd; };
+
+    RmtModuleMeta meta;
+    bool meta_ok = true;
+
+    // Minimum requirement for ANY usable metadata (song view + round-trip):
+    // pointers must all be inside the loaded block. RMT itself doesn't
+    // enforce any ordering between the four pointer slots, so don't reject
+    // a file just because the tables aren't in the order PokeyForge would
+    // emit. We only need ptrTracksHi - ptrTracksLo (the track-table size)
+    // and ptrSongData (the song-list base) to be coherent.
+    if (!ptrInBlock(ptrInstruments) || !ptrInBlock(ptrTracksLo) ||
+        !ptrInBlock(ptrTracksHi)    || !ptrInBlock(ptrSongData)) {
+        meta.fail_reason = "pointer(s) out of block";
+        meta_ok = false;
+    }
+
+    int numTracks = 0;
+    if (meta_ok) {
+        const int numTracksA = ptrTracksHi - ptrTracksLo;
+        if (numTracksA < 0 || numTracksA > 256) {
+            meta.fail_reason = "track-table size out of range (" +
+                               std::to_string(numTracksA) + ")";
+            meta_ok = false;
+        } else {
+            numTracks = numTracksA;
+        }
+    }
+
+    if (meta_ok) {
+        // Read the per-track 16-bit pointers.
+        std::vector<int> trackPtr(numTracks, 0);
+        for (int i = 0; i < numTracks; ++i) {
+            trackPtr[i] = mem[ptrTracksLo + i] | (mem[ptrTracksHi + i] << 8);
+        }
+
+        // Build the sorted boundary set: every reasonable "next-thing"
+        // pointer that could mark the end of a track's event data.
+        // Tracks are packed contiguously in RMT-exported modules, so
+        // a track's bytes run from its pointer to the next-higher
+        // boundary in this set.
+        std::vector<int> boundaries;
+        boundaries.push_back(ptrSongData);
+        boundaries.push_back(blockEnd);
+        for (int i = 0; i < numTracks; ++i) {
+            if (trackPtr[i] > 0 && ptrInBlock(trackPtr[i]))
+                boundaries.push_back(trackPtr[i]);
+        }
+        for (int i = 0; i < numInstr; ++i) {
+            int ip = mem[ptrInstruments + i * 2] |
+                     (mem[ptrInstruments + i * 2 + 1] << 8);
+            if (ip > 0 && ptrInBlock(ip)) boundaries.push_back(ip);
+        }
+        std::sort(boundaries.begin(), boundaries.end());
+        boundaries.erase(std::unique(boundaries.begin(), boundaries.end()),
+                         boundaries.end());
+
+        meta.tracks.resize(numTracks);
+        for (int i = 0; i < numTracks; ++i) {
+            int start = trackPtr[i];
+            if (start <= 0 || !ptrInBlock(start)) {
+                // Zero pointer or out-of-range - keep an empty blob.
+                continue;
+            }
+            auto it = std::upper_bound(boundaries.begin(),
+                                       boundaries.end(), start);
+            int end = (it == boundaries.end()) ? blockEnd : *it;
+            if (end <= start) continue;
+            meta.tracks[i].assign(mem.begin() + start, mem.begin() + end);
+        }
+
+        // Capture the entire song region (ptrSongData..blockEnd). This is
+        // what RMT itself uses (CSong::AtaToSong walks the full byte range
+        // and handles multiple 254-goto records as sub-song terminators).
+        // The previous code stopped at the FIRST 254 which truncated
+        // multi-section modules to a single sub-song.
+        meta.song_data.assign(mem.begin() + ptrSongData,
+                              mem.begin() + blockEnd);
+
+        // For backward-compat with the single-section round-trip path:
+        // record the offset of the FIRST goto's target relative to
+        // ptrSongData. SaveRmtRoundTrip uses this when re-patching the
+        // first goto on save. Multi-section round-trip is best-effort
+        // (only the first sub-song's goto is re-pointed).
+        meta.song_goto_target_off = 0;
+        {
+            const int rowLen = (mem[addr + 3] == '8') ? 8 : 4;
+            int col = 0;
+            int q = ptrSongData;
+            while (q + 3 < blockEnd) {
+                if (mem[q] == 254 && col == 0) {
+                    int gotoTarget = mem[q + 2] | (mem[q + 3] << 8);
+                    meta.song_goto_target_off = gotoTarget - ptrSongData;
+                    break;
+                }
+                ++q;
+                ++col;
+                if (col >= rowLen) col = 0;
+            }
+        }
+    }
+
+    if (meta_ok) {
+        meta.valid             = true;
+        meta.base_addr         = addr;
+        meta.num_instr_source  = numInstr;
+        meta.num_tracks        = numTracks;
+        meta.channels          = mem[addr + 3];
+        meta.track_len         = mem[addr + 4];
+        meta.song_speed        = mem[addr + 5];
+        meta.instr_speed       = mem[addr + 6];
+        meta.format_ver        = mem[addr + 7];
+        meta.song_name         = std::move(songName);
+        m_rmt_source           = std::move(meta);
     }
     return loaded;
 }

@@ -398,6 +398,19 @@ struct App {
         config.Save();
     }
 
+    // Window title shows the loaded bank's full path so the user can see
+    // exactly which file they're working with (drives + folder + name).
+    // With no bank loaded the title falls back to the app+version banner.
+    void UpdateWindowTitle()
+    {
+        if (!window) return;
+        std::string title = "PokeyForge " POKEYFORGE_VERSION;
+        if (!last_bank_path.empty()) {
+            title += " - " + last_bank_path;
+        }
+        SDL_SetWindowTitle(window, title.c_str());
+    }
+
     bool LoadCurrent()
     {
         int node = dir.CurrentNodeIndex();
@@ -542,6 +555,38 @@ struct App {
         engine.NoteOn(kBaseTrack, note, kSampleSlot, kPlayVolume);
         last_play_semitone = semitone;
         last_note_played = note;
+    }
+
+    // Play a single row from the decoded track view: load `instr_index`'s
+    // ATA blob into the sample slot and trigger `note` on POKEY voice
+    // `channel` at the row's vol. The note value is RMT-absolute (0..60)
+    // and bypasses octave_shift - we're playing what's IN the song, not
+    // auditioning at a new pitch. `channel` is the POKEY voice (0..3 for
+    // 4-channel modules, 0..7 for stereo); it matches the song-order
+    // column the track was originally placed on.
+    void PlayTrackRow(int note, int instr_index, int vol, int channel)
+    {
+        if (note < 0 || note > kMaxNote) return;
+        if (instr_index < 0 || instr_index >= Bank::SLOT_COUNT) {
+            SetNotice("No instrument on this row (and none carried forward)");
+            return;
+        }
+        const Bank::Slot& s = bank.At(instr_index);
+        if (!s.used || s.ata.empty()) {
+            SetNotice("Track row uses empty bank slot " +
+                      std::to_string(instr_index));
+            return;
+        }
+        engine.LoadInstrumentSlot(kSampleSlot, s.ata.data(), s.ata.size());
+        int v = (vol >= 0) ? std::clamp(vol, 0, 15) : kPlayVolume;
+        int ch = std::clamp(channel, 0, 7);
+        engine.NoteOn(ch, std::clamp(note, kMinNote, kMaxNote),
+                      kSampleSlot, v);
+        last_note_played = note;
+        // Highlight the instrument's bank slot so the user can see which
+        // slot the row used. Cursor only - we don't replace the editor's
+        // working instrument here (use the bank panel for that).
+        bank_cursor = instr_index;
     }
 
     // Copy the current instrument (working copy) into a bank slot, overriding
@@ -1168,6 +1213,7 @@ struct App {
 
         last_bank_path = rmt.string();
         SaveConfig();
+        UpdateWindowTitle();
 
         if (rmt_ok && n >= 0) {
             bank.MarkAllClean();   // everything is now on disk -> green
@@ -1404,7 +1450,7 @@ struct App {
         }
     }
 
-    // Ctrl+Shift+R: clear every per-file manual override across the whole
+    // Ctrl+Alt+R: clear every per-file manual override across the whole
     // library. No confirm dialog - the action is fully reversible by
     // setting overrides again.
     void ClearAllOverrides()
@@ -1602,6 +1648,7 @@ struct App {
         bank_cursor = 0;
         last_bank_path = path;
         SaveConfig();
+        UpdateWindowTitle();
         SetNotice("Loaded bank: " + std::to_string(n) + " instruments from " +
                   fs::path(path).filename().string());
     }
@@ -1792,7 +1839,7 @@ struct App {
                   std::to_string(dir.ClusterCount()) + " clusters)");
     }
 
-    // Ctrl+R: cycle the current file's manual category override through
+    // Shift+Ctrl+R: cycle the current file's manual category override through
     // every Analysis::Category value, ending at "use auto" (-1). The
     // tree's "M" marker shows when an override is set; saving analysis
     // again persists it.
@@ -2237,6 +2284,9 @@ int main(int argc, char* argv[])
         int n = app.LoadBankFromPath(app.last_bank_path);
         if (n > 0) std::printf("Reloaded bank: %d instruments\n", n);
     }
+    // Reflect the loaded bank's filename in the title bar - or fall back
+    // to the plain app+version banner when no bank is loaded.
+    app.UpdateWindowTitle();
 
     if (!initial_file.empty()) {
         fs::path want = fs::absolute(initial_file, ec);
@@ -2336,6 +2386,24 @@ int main(int argc, char* argv[])
                 if (gui.PointInOctaveIndicator(mx, my)) {
                     app.AdjustOctave(-notches * 12);  // wheel up -> +12
                     continue;
+                }
+                // Song-order panel and Track-view panel: plain wheel scrolls
+                // rows in that panel; Ctrl+wheel in either panel steps the
+                // selected track index. Routed before the edit-field nudge
+                // so they can't be hijacked by the Params hit-test (both
+                // panels live inside the Params bar).
+                {
+                    bool ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+                    GuiState sg;
+                    sg.bank = &app.bank;
+                    if (gui.PointInSongOrder(mx, my)) {
+                        gui.ScrollSongOrder(notches, ctrl, sg);
+                        continue;
+                    }
+                    if (gui.PointInTrackView(mx, my)) {
+                        gui.ScrollTrackView(notches, ctrl, sg);
+                        continue;
+                    }
                 }
                 // Wheel over the edit area: auto-enter edit mode on the
                 // hovered field (if any) and nudge it.  If no cell is directly
@@ -2697,6 +2765,35 @@ int main(int argc, char* argv[])
                     if (app.bank.At(slot).used) {
                         app.GuardedNav([&app, slot]() { app.LoadBankSlot(slot); });
                     }
+                } else if (int arr = gui.TrackArrowAt((int)event.button.x, (int)event.button.y)) {
+                    // Track-view inline arrows on the title row: step the
+                    // selected track index left/right.
+                    GuiState sg;
+                    sg.bank = &app.bank;
+                    gui.StepTrack(arr, sg);
+                } else if (gui.PointInSongOrder((int)event.button.x, (int)event.button.y)) {
+                    // Click a track cell in the song-order panel -> select
+                    // that track in the track view AND remember which
+                    // POKEY voice (column) it was placed on, so subsequent
+                    // track-row clicks play on the same voice.
+                    GuiState sg;
+                    sg.bank = &app.bank;
+                    Gui::SongCellHit hit = gui.SongCellAt(
+                        (int)event.button.x, (int)event.button.y, sg);
+                    if (hit.track >= 0) gui.SelectTrack(hit.track, sg, hit.channel);
+                } else if (gui.PointInTrackView((int)event.button.x, (int)event.button.y)) {
+                    // Click a decoded track row -> play that note with the
+                    // row's effective instrument + volume (carried forward
+                    // from earlier rows when the row itself has '-'), on
+                    // the POKEY voice the track was selected from.
+                    GuiState sg;
+                    sg.bank = &app.bank;
+                    Gui::TrackRowHit hit = gui.TrackRowAt(
+                        (int)event.button.x, (int)event.button.y, sg);
+                    if (hit.row >= 0 && hit.note >= 0) {
+                        app.PlayTrackRow(hit.note, hit.instr, hit.vol,
+                                         gui.SelectedChannel());
+                    }
                 } else {
                     // Check instrument header buttons (Undo / Redo / Revert)
                     // before the general field hit-test.
@@ -2850,17 +2947,11 @@ int main(int argc, char* argv[])
             if (k == SDLK_F8)  { app.ToggleGrouping();      continue; }
             if (k == SDLK_F9)  { app.ToggleHideDuplicates(); continue; }
             if (k == SDLK_F10) { app.ToggleClusterView();    continue; }
-            // Ctrl+R reclassifies the current instrument (cycles its manual
-            // override through the categories). Quick way to fix a misfiled
-            // file without leaving the keyboard. Ctrl+Shift+R clears every
-            // override library-wide.
+            // Ctrl+] / Ctrl+[ step the k-means cluster-count override for
+            // the next analysis run (0 = auto). These are non-letter keys
+            // so they can't conflict with the Ctrl+letter audition ramp.
             {
-                bool ctrl  = (SDL_GetModState() & SDL_KMOD_CTRL)  != 0;
-                bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
-                if (ctrl && shift && k == SDLK_R) { app.ClearAllOverrides(); continue; }
-                if (ctrl && k == SDLK_R)          { app.CycleManualCategory(); continue; }
-                // Ctrl+] / Ctrl+[ step the k-means cluster-count override
-                // for the next analysis run (0 = auto).
+                bool ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
                 if (ctrl && k == SDLK_RIGHTBRACKET) { app.StepClusterCount(+1); continue; }
                 if (ctrl && k == SDLK_LEFTBRACKET)  { app.StepClusterCount(-1); continue; }
             }
@@ -2874,6 +2965,13 @@ int main(int argc, char* argv[])
                 // Ctrl bank verbs (selected slot) + audition the edited
                 // instrument with Ctrl+a..z/0..9.
                 if (ctrl) {
+                    bool alt = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
+                    // Reclassify shortcuts use modifier combos so plain
+                    // Ctrl+R can still play the 'R' audition note.
+                    //   Shift+Ctrl+R  -> cycle this file's category
+                    //   Ctrl+Alt+R    -> clear every override library-wide
+                    if (k == SDLK_R && shift && !alt) { app.CycleManualCategory(); continue; }
+                    if (k == SDLK_R && alt && !shift) { app.ClearAllOverrides();   continue; }
                     if (k == SDLK_Z) { app.Undo(); continue; }
                     // C / X / V / Y / S are bank-edit verbs only. Outside
                     // bank EDIT mode they fall through to the audition path
@@ -2900,6 +2998,19 @@ int main(int argc, char* argv[])
                 switch (k) {
                     case SDLK_ESCAPE: app.editor.SetActive(false);
                                       app.SetNotice("Edit mode OFF (browsing)"); break;
+                    case SDLK_RETURN:
+                    case SDLK_KP_ENTER:
+                        // On the name panel, ENTER commits the rename into
+                        // the bank (saves the working instrument as a slot
+                        // and refreshes the bank display). For value
+                        // panels it does nothing — the user is on a hex
+                        // cell and ENTER isn't a meaningful gesture there.
+                        if (name_panel) {
+                            if (app.CommitToBank()) {
+                                app.editor.SetActive(false);
+                            }
+                        }
+                        break;
                     case SDLK_TAB:    app.editor.NextPanel(shift ? -1 : +1); break;
                     case SDLK_LEFT:   app.editor.Move(-1, 0, app.current_instr); break;
                     case SDLK_RIGHT:  app.editor.Move(+1, 0, app.current_instr); break;
@@ -2936,12 +3047,20 @@ int main(int argc, char* argv[])
             // ---------- BROWSE MODE ----------
             // Ctrl bank verbs operate on the selected bank slot.
             if (SDL_GetModState() & SDL_KMOD_CTRL) {
-                if (k == SDLK_Z) { app.Undo(); continue; }
-                // C / X / V / Y / S are bank-edit verbs only. Outside bank
-                // EDIT mode they fall through and play the selected slot,
-                // so Ctrl+S can't accidentally export when the user meant
-                // to audition the 'S' note.
+                bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+                bool alt   = (SDL_GetModState() & SDL_KMOD_ALT)   != 0;
+                // Reclassify shortcuts use modifier combos so plain Ctrl+R
+                // can still play the 'R' audition note.
+                //   Shift+Ctrl+R  -> cycle this file's category
+                //   Ctrl+Alt+R    -> clear every override library-wide
+                if (k == SDLK_R && shift && !alt) { app.CycleManualCategory(); continue; }
+                if (k == SDLK_R && alt && !shift) { app.ClearAllOverrides();   continue; }
+                // Z / C / X / V / Y / S are bank-edit verbs only. Outside
+                // bank EDIT mode they fall through and play the selected
+                // slot at that pitch, so Ctrl+Z can't accidentally fire
+                // Undo when the user meant to audition the 'Z' note.
                 if (app.bank_edit) {
+                    if (k == SDLK_Z) { app.Undo(); continue; }
                     if (k == SDLK_C) { app.CopySlot(); continue; }
                     if (k == SDLK_X) { app.CutSlot(); continue; }
                     if (k == SDLK_V) { app.PasteSlot(); continue; }
@@ -3052,6 +3171,30 @@ int main(int argc, char* argv[])
         gs.current_bank_slot = (app.current_source == App::Source::Bank)
                                    ? app.current_bank_slot : -1;
         if (SDL_GetTicks() < app.notice_until) gs.notice = app.notice;
+        // Hover tooltip for the header Undo/Redo/Revert buttons. A live
+        // transient notice still wins (it's the more time-sensitive
+        // signal); otherwise the hint replaces the F-key strip in the
+        // command bar.
+        if (gs.notice.empty()) {
+            char hb = gui.InstrHeaderButtonAt(app.mouse_x, app.mouse_y);
+            if (hb == 'u') {
+                gs.notice = "Undo last edit  (Ctrl+Z in EDIT mode)";
+            } else if (hb == 'r') {
+                gs.notice = "Redo last undone edit  (Ctrl+Y in EDIT mode)";
+            } else if (hb == 'v') {
+                gs.notice = "Revert: reload the working instrument from its .rti file on disk";
+            } else if (gui.PointInBankEdit(app.mouse_x, app.mouse_y)) {
+                gs.notice = app.bank_edit
+                    ? "Bank EDIT: ON  -  Ctrl+C/X/V move slots, Ctrl+Z/Y undo/redo, Ctrl+S export, Shift+Ctrl+R reclassify. Click to exit."
+                    : "Bank EDIT: OFF  -  click to enable slot editing (Ctrl+C/X/V, Ctrl+Z/Y, Ctrl+S, Shift+Ctrl+R). Plain Ctrl+letter plays the slot.";
+            } else if (gui.PointInBankAnalyse(app.mouse_x, app.mouse_y)) {
+                gs.notice = "Analyse the library: classify instruments and detect duplicates (writes analysis.json)  [F7]";
+            } else if (gui.PointInStereoToggle(app.mouse_x, app.mouse_y)) {
+                gs.notice = app.instr_stereo
+                    ? "Stereo: VolL and VolR are independent. Click to switch to Mono (channels lock together)."
+                    : "Mono: VolL/VolR mirror each other. Click to switch to Stereo (independent channels).";
+            }
+        }
         gui.Render(renderer, gs);
 
         SDL_RenderPresent(renderer);

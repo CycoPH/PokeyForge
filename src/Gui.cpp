@@ -782,7 +782,7 @@ void Gui::DrawHeader(SDL_Renderer* r, const GuiState& s)
 	const int kHdrTxtY = std::max(0, (kHeaderH - GlyphH()) / 2);
 	int used = s.bank ? s.bank->UsedCount() : 0;
 	DrawTextF(r, kText, 548, kHdrTxtY, "Clock: %s", s.ntsc ? "NTSC 60Hz" : "PAL 50Hz");
-	DrawTextF(r, kText, 690, kHdrTxtY, "Oct: %+d", s.octave_shift);
+	DrawTextF(r, kText, 690, kHdrTxtY, "Oct:%+d", s.octave_shift);
 	DrawTextF(r, kText, 755, kHdrTxtY, "Bank: %02d/64", used);
 
 	// [EDIT] and MODIFIED are pinned to the LEFT of the tone-number
@@ -1289,6 +1289,20 @@ namespace {
 
 } // anonymous namespace
 
+// Geometry shared between DrawParameters and EditFieldAtLogical (Params
+// section). Kept in one place so the hit-test can't drift from the
+// renderer.
+namespace {
+	constexpr int kParamColStride = 130;   // x-spacing between the two param cols
+	constexpr int kParamColX0     = 16;    // first param col, offset from x0
+	constexpr int kParamColW      = 120;   // hit-width of a single param row
+	constexpr int kAudctlOffsetX  = 260;   // AUDCTL grid left edge, offset from x0
+	constexpr int kFlagW          = 88;
+	constexpr int kFlagSX         = 92;    // AUDCTL col stride (button + gap)
+	constexpr int kSongPanelX     = 464;   // song-order panel left edge, offset from x0
+	constexpr int kTrackPanelX    = 664;   // track-view panel left edge, offset from x0
+}
+
 void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 {
 	int x0 = kMainX + 2;
@@ -1301,33 +1315,45 @@ void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 	FocusFrame(r, s, Editor::Panel::Params, x0, y0, w, h);
 	DrawSectionTitle(r, x0 + 8, y0 + 6, w - 16,
 		EditingPanel(s, Editor::Panel::Params)
-		? "Parameters  [EDITING - Tab to switch]" : "Parameters");
+		? "Parameters [EDITING]" : "Parameters");
+	// "AUDCTL" caption rides on the same header row as the section title,
+	// horizontally aligned with the flag grid below it.
+	DrawText(r, kHighlight, x0 + kAudctlOffsetX, y0 + 6, "AUDCTL");
+
+	// Two vertical dividers split the panel into three columns:
+	//   1. params + AUDCTL (left)   2. song order (middle)   3. track view (right)
+	SetCol(r, kBorder);
+	int divx1 = x0 + kSongPanelX - 4;
+	int divx2 = x0 + kTrackPanelX - 4;
+	SDL_RenderLine(r, (float)divx1, (float)(y0 + 4), (float)divx1, (float)(y0 + h - 4));
+	SDL_RenderLine(r, (float)divx2, (float)(y0 + 4), (float)divx2, (float)(y0 + h - 4));
 
 	if (!s.instrument) {
 		DrawText(r, kTextDim, x0 + 16, y0 + 28, "(no data)");
+		DrawSongOrder(r, s);
+		DrawTrackView(r, s);
 		return;
 	}
 	const int* par = s.instrument->parameters;
 	const int gh = GlyphH();
 
-	// 12 named params in 2 columns of 6.
+	// 12 named params in 2 tight columns of 6.
 	for (int i = 0; i < 12; ++i) {
 		int col = i / 6;
 		int row = i % 6;
-		int x = x0 + 16 + col * 220;
-		int ry = y0 + 28 + row * kParamRowH;  // top of the row slot
-		DrawTextF(r, kText, x, ry + std::max(0, (kParamRowH - gh) / 2), "%s : %02X",
+		int x = x0 + kParamColX0 + col * kParamColStride;
+		int ry = y0 + 28 + row * kParamRowH;
+		DrawTextF(r, kText, x, ry + std::max(0, (kParamRowH - gh) / 2), "%s:%02X",
 			kParamLabels[i].name, par[kParamLabels[i].idx] & 0xFF);
 	}
 
-	// AUDCTL flags, 8 bits as a 4x2 grid of wide toggles (room for labels).
-	int ax = x0 + 460;
+	// AUDCTL flags, 8 bits as a 2-col x 4-row grid. Top row aligns with the
+	// first param row (Env Goto / Tbl Len). The caption sits up on the
+	// section-title row, leaving the panel area free for the four button rows.
+	int ax = x0 + kAudctlOffsetX;
 	int ay = y0 + 28;
-	const int kFlagH = gh + 4;   // button height: just tall enough for the font
-	constexpr int kFlagW = 88, kFlagSX = 92;
-	const int kFlagSY = kFlagH + 4;   // row stride
-	// "AUDCTL" header label row
-	DrawText(r, kHighlight, ax, ay + std::max(0, (kFlagSY - gh) / 2), "AUDCTL  (click to toggle)");
+	const int kFlagH = gh + 4;
+	const int kFlagSY = kFlagH + 2;
 	static const char* names[8] = {
 		"15kHz", "HPF 2", "HPF 1", "Join3-4",
 		"Join1-2", "1.79MHz3", "1.79MHz1", "Poly9"
@@ -1337,8 +1363,8 @@ void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 		PAR_AUDCTL_JOIN_1_2, PAR_AUDCTL_179_CH3, PAR_AUDCTL_179_CH1, PAR_AUDCTL_POLY9
 	};
 	for (int i = 0; i < 8; ++i) {
-		int col = i % 4, row = i / 4;
-		int bx = ax + col * kFlagSX, by = ay + kFlagSY + row * kFlagSY;
+		int col = i % 2, row = i / 2;
+		int bx = ax + col * kFlagSX, by = ay + row * kFlagSY;
 		bool on = par[idxs[i]] != 0;
 		Col cell = on ? kAccent : kBankEmpty;
 		FillRect(r, cell, bx, by, kFlagW, kFlagH);
@@ -1351,19 +1377,22 @@ void Gui::DrawParameters(SDL_Renderer* r, const GuiState& s)
 		int ci = s.editor->param_idx;
 		if (ci < 12) {
 			int col = ci / 6, row = ci % 6;
-			int cx = x0 + 16 + col * 220;
+			int cx = x0 + kParamColX0 + col * kParamColStride;
 			int cy = y0 + 28 + row * kParamRowH;
-			CellCursor(r, cx - 2, cy - 1, 210, kParamRowH);
+			CellCursor(r, cx - 2, cy - 1, kParamColW, kParamRowH);
 		}
 		else {
 			int fi = ci - 12;
 			if (fi >= 0 && fi < 8) {
-				int col = fi % 4, row = fi / 4;
-				CellCursor(r, ax + col * kFlagSX - 1, ay + kFlagSY + row * kFlagSY - 1,
+				int col = fi % 2, row = fi / 2;
+				CellCursor(r, ax + col * kFlagSX - 1, ay + row * kFlagSY - 1,
 					kFlagW + 2, kFlagH + 2);
 			}
 		}
 	}
+
+	DrawSongOrder(r, s);
+	DrawTrackView(r, s);
 }
 
 void Gui::DrawEnvelope(SDL_Renderer* r, const GuiState& s)
@@ -1953,23 +1982,24 @@ Gui::EditHit Gui::EditFieldAtLogical(int x, int y, const TInstrument& ins) const
 	// --- Parameters ---
 	{
 		int x0 = kMainX + 2, y0 = kParamY0;
-		// 12 named params: 2 columns of 6.
+		// 12 named params: 2 tight columns of 6 (must match DrawParameters).
 		for (int i = 0; i < 12; ++i) {
 			int col = i / 6, row = i % 6;
-			int cx = x0 + 16 + col * 220;
+			int cx = x0 + kParamColX0 + col * kParamColStride;
 			int cy = y0 + 28 + row * kParamRowH;
-			if (x >= cx - 2 && x < cx + 208 && y >= cy && y < cy + kParamRowH) {
+			if (x >= cx - 2 && x < cx + kParamColW && y >= cy && y < cy + kParamRowH) {
 				r.hit = true; r.panel = Editor::Panel::Params; r.a = i; return r;
 			}
 		}
-		// 8 AUDCTL flag boxes (4x2 grid, must match DrawParameters).
-		int ax = x0 + 460, ay = y0 + 28;
-		const int kFlagH_ht = 22;  // generous hit area (slightly larger than drawn)
-		constexpr int kFlagSX_ht = 92, kFlagSY_ht = 22;
+		// 8 AUDCTL flag boxes (2-col x 4-row grid, must match DrawParameters).
+		int ax = x0 + kAudctlOffsetX, ay = y0 + 28;
+		const int gh = GlyphH();
+		const int kFlagH_ht = gh + 4;
+		const int kFlagSY_ht = kFlagH_ht + 2;
 		for (int fi = 0; fi < 8; ++fi) {
-			int col = fi % 4, row = fi / 4;
-			int bx = ax + col * kFlagSX_ht, by = ay + kFlagSY_ht + row * kFlagSY_ht;
-			if (x >= bx && x < bx + 88 && y >= by && y < by + kFlagH_ht) {
+			int col = fi % 2, row = fi / 2;
+			int bx = ax + col * kFlagSX, by = ay + row * kFlagSY_ht;
+			if (x >= bx && x < bx + kFlagW && y >= by && y < by + kFlagH_ht) {
 				r.hit = true; r.panel = Editor::Panel::Params; r.a = 12 + fi; return r;
 			}
 		}
@@ -2193,6 +2223,587 @@ namespace {
 		"New", "Clear", "Export RTI", "Import RTI", "Analyse",
 	};
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Song order panel  (lives in the right half of the Parameters bar)
+// ---------------------------------------------------------------------------
+
+namespace {
+	// Geometry shared by DrawSongOrder, PointInSongOrder, and the scroll
+	// logic. The panel sits inside the Parameters bar; its left edge is
+	// kSongPanelX (from x0), its top kParamY0+4, and it ends at the
+	// Parameters panel's bottom-2.
+	struct SongGeom {
+		int x;       // panel left
+		int y;       // panel top (just inside the params panel)
+		int w;       // panel width
+		int h;       // panel height
+		int list_y;  // first list row
+		int row_h;   // height of one order-list row
+		int visible; // max rows that fit
+	};
+
+	// Pixel columns used by song-order rows. The row text is
+	// "NN  TT TT TT TT" laid out with a fixed 8 px glyph width:
+	//   line# (2) + "  " (2)    = 4 glyphs = 32 px  -> kSongCellsX
+	//   each cell: "TT " (3)    = 24 px            -> kSongCellW
+	// A click anywhere inside cell band `c` selects track L.tracks[c].
+	constexpr int kSongCellsX = 32;   // x offset of cell 0, relative to g.x
+	constexpr int kSongCellW  = 24;   // stride per cell
+
+	SongGeom ComputeSongGeom()
+	{
+		SongGeom g;
+		g.x = kMainX + 2 + kSongPanelX;
+		g.y = kParamY0;
+		// Width is now just the middle column - the right column belongs
+		// to the track view (DrawTrackView).
+		g.w = kTrackPanelX - kSongPanelX - 4;
+		g.h = kParamH;
+		// Title rides on the section-title row (y0+6, "Parameters"/"AUDCTL").
+		// First list row aligns with the first params row (y0+28).
+		g.row_h  = 14;
+		g.list_y = g.y + 28;
+		int list_h = g.h - (g.list_y - g.y) - 4;
+		g.visible = std::max(1, list_h / g.row_h);
+		return g;
+	}
+
+	// Track view (right column of the Parameters bar).
+	struct TrackGeom {
+		int x, y, w, h;
+		int list_y;
+		int row_h;
+		int visible;
+		// Title-row arrow buttons (inline next to "Track NN").
+		int arrow_y, arrow_h;
+		int arrow_left_x,  arrow_left_w;
+		int arrow_right_x, arrow_right_w;
+	};
+
+	TrackGeom ComputeTrackGeom()
+	{
+		TrackGeom g;
+		g.x = kMainX + 2 + kTrackPanelX;
+		g.y = kParamY0;
+		g.w = (kMainX + 2 + (kMainW - 4)) - g.x - 4;
+		g.h = kParamH;
+		g.row_h  = 14;
+		g.list_y = g.y + 28;
+		int list_h = g.h - (g.list_y - g.y) - 4;
+		g.visible = std::max(1, list_h / g.row_h);
+		// Arrows are square-ish buttons that match the title-row text
+		// height (16 px glyph + 2 px padding top/bottom = 20 px) so they
+		// don't look cramped next to "Track NN  ch N".
+		g.arrow_h = 20;
+		g.arrow_y = g.y + 4;
+		const int btn_w = 20;
+		const int title_chars = (int)std::strlen("Track NN  ch N ");  // 15
+		int title_w = title_chars * 8;
+		g.arrow_left_x  = g.x + title_w + 4;
+		g.arrow_left_w  = btn_w;
+		g.arrow_right_x = g.arrow_left_x + btn_w + 4;
+		g.arrow_right_w = btn_w;
+		return g;
+	}
+
+	// Decoded form of one track row, mirroring TTrack's per-step fields.
+	struct TrackRow {
+		int note  = -1;   // 0..60, or -1 = empty
+		int instr = -1;   // 0..63, or -1 = no change
+		int vol   = -1;   // 0..15, or -1 = no change
+		int speed = -1;   // 0..255, or -1 = no change
+	};
+
+	// Decode a raw RMT track event blob into note/instr/vol/speed per row,
+	// matching CTracks::AtaToTrack. `out_len` is the active row count, and
+	// `out_go` is the goto-loop row (-1 if absent).
+	void DecodeTrack(const std::vector<unsigned char>& mem,
+	                 std::vector<TrackRow>& rows, int& out_len, int& out_go)
+	{
+		rows.assign(256, TrackRow{});
+		out_len = 0;
+		out_go  = -1;
+
+		const int trackLength = (int)mem.size();
+		int gotoIndex = -1;
+		if (trackLength >= 2 && mem[trackLength - 2] == (128 + 63)) {
+			gotoIndex = mem[trackLength - 1];
+		}
+
+		int line = 0;
+		int src  = 0;
+		while (src < trackLength && line < (int)rows.size()) {
+			if (src == gotoIndex) out_go = line;
+
+			unsigned char data = mem[src] & 0x3f;
+
+			if (/*data >= 0 &&*/ data <= 60) {
+				rows[line].note  = data;
+				rows[line].instr = (mem[src + 1] & 0xfc) >> 2;
+				rows[line].vol   = ((mem[src + 1] & 0x03) << 2)
+				                 | ((mem[src + 0] & 0xc0) >> 6);
+				src += 2;
+				++line;
+				continue;
+			}
+			if (data == 61) {
+				rows[line].vol = ((mem[src + 1] & 0x03) << 2)
+				               | ((mem[src + 0] & 0xc0) >> 6);
+				src += 2;
+				++line;
+				continue;
+			}
+			if (data == 62) {
+				unsigned char count = mem[src] & 0xc0;
+				if (count == 0) {
+					if (src + 1 >= trackLength || mem[src + 1] == 0) break;
+					line += mem[src + 1];
+					src  += 2;
+				} else {
+					line += (count >> 6);
+					src  += 1;
+				}
+				continue;
+			}
+			if (data == 63) {
+				unsigned char count = mem[src] & 0xc0;
+				if (count == 0) {
+					if (src + 1 < trackLength) rows[line].speed = mem[src + 1];
+					src += 2;
+					continue;
+				}
+				out_len = line;
+				return;
+			}
+			// Unreachable - all five 6-bit ranges handled above.
+			break;
+		}
+		out_len = line;
+	}
+
+	// Note name + octave: 0..60 -> "C-1".."C-6".
+	void NoteToString(int n, char out[4])
+	{
+		static const char* names[12] = {
+			"C-","C#","D-","D#","E-","F-","F#","G-","G#","A-","A#","B-"
+		};
+		if (n < 0 || n > 60) { out[0] = '-'; out[1] = '-'; out[2] = '-'; out[3] = 0; return; }
+		const char* nm = names[n % 12];
+		int octave = (n / 12) + 1;
+		out[0] = nm[0];
+		out[1] = nm[1];
+		out[2] = (char)('0' + octave);
+		out[3] = 0;
+	}
+
+	// Decoded form of one song line. tracks[c] is either a track index
+	// (0..253) or -1 for an empty slot (RMT's "--"). goto_target is the
+	// target line for a goto-line, or -1 for a normal line.
+	struct SongLine {
+		int tracks[8] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+		int goto_target = -1;
+	};
+
+	// Decode meta.song_data into a vector of SongLine values, matching
+	// the RMT loader (CSong::AtaToSong):
+	//   - Walk byte-by-byte (NOT row-by-row), incrementing col, then line.
+	//   - b in [0..253] = track index; b >= 254 in non-goto context = empty.
+	//   - b == 254 at col 0 starts a goto row. The 4-byte goto record
+	//     terminates ONE sub-song; multi-section modules contain several
+	//     goto records back-to-back, and RMT keeps parsing past each one
+	//     (i += rowLen, line++, continue). We do the same here.
+	std::vector<SongLine> DecodeSong(const Bank::RmtModuleMeta& meta)
+	{
+		std::vector<SongLine> out;
+		if (!meta.valid || meta.song_data.empty()) return out;
+		const int channels = (meta.channels == '8') ? 8 : 4;
+		const auto& sd = meta.song_data;
+		const int rowLen = channels;   // matches RMT's g_tracks4_8
+
+		SongLine cur;
+		int col = 0;
+		size_t i = 0;
+		while (i < sd.size() && out.size() < 256) {
+			unsigned b = sd[i];
+			if (b == 254u && col == 0) {
+				// Goto record: [254, target_line, lo, hi] followed by
+				// (rowLen-4) padding bytes (only present in 8-channel
+				// modules). Skip the whole rowLen-byte record so we
+				// land on the next line.
+				int target = (i + 1 < sd.size()) ? (int)sd[i + 1] : 0;
+				cur = SongLine{};
+				cur.goto_target = target;
+				out.push_back(cur);
+				cur = SongLine{};
+				col = 0;
+				i += (size_t)rowLen;
+				continue;
+			}
+			if (b < 254u) {
+				cur.tracks[col] = (int)b;
+			} else {
+				// b == 254 mid-row (treat as empty) or b == 255 (empty).
+				cur.tracks[col] = -1;
+			}
+			++col;
+			if (col >= channels) {
+				out.push_back(cur);
+				cur = SongLine{};
+				col = 0;
+			}
+			++i;
+		}
+		// If we ran out of bytes mid-row, still emit the partial line so
+		// any visible track refs aren't lost.
+		bool partial = false;
+		for (int c = 0; c < channels; ++c) if (cur.tracks[c] != -1) partial = true;
+		if (partial) out.push_back(cur);
+		return out;
+	}
+}
+
+void Gui::DrawSongOrder(SDL_Renderer* r, const GuiState& s)
+{
+	SongGeom g = ComputeSongGeom();
+
+	const int gh = GlyphH();
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+
+	// Title rides on the same row as "Parameters" / "AUDCTL".
+	DrawText(r, kHighlight, g.x, g.y + 6, "Song order");
+
+	if (!s.bank) {
+		DrawText(r, kTextDim, g.x, g.list_y, "(no bank pointer)");
+		return;
+	}
+	if (!meta.valid) {
+		std::string msg = "(song view disabled";
+		if (!meta.fail_reason.empty()) msg += ": " + meta.fail_reason;
+		msg += ")";
+		DrawText(r, kTextDim, g.x, g.list_y, msg.c_str());
+		return;
+	}
+	if (meta.song_data.empty()) {
+		DrawText(r, kTextDim, g.x, g.list_y, "(song_data empty)");
+		return;
+	}
+	(void)gh;
+
+	const int channels = (meta.channels == '8') ? 8 : 4;
+	const std::vector<SongLine> lines = DecodeSong(meta);
+	const int rows = (int)lines.size();
+	const int num_tr = std::max(meta.num_tracks, 0);
+
+	// Track-preview row clamps to the actual track count so Ctrl+wheel
+	// can't sit on a non-existent index.
+	if (num_tr > 0) m_song_track = std::clamp(m_song_track, 0, num_tr - 1);
+	else            m_song_track = 0;
+
+	// Clamp scroll so the last visible row aligns with the bottom when the
+	// list is taller than the panel; otherwise scroll = 0.
+	int max_scroll = std::max(0, rows - g.visible);
+	m_song_scroll = std::clamp(m_song_scroll, 0, max_scroll);
+
+	// Draw the visible window of order rows.
+	for (int i = 0; i < g.visible; ++i) {
+		int row = m_song_scroll + i;
+		if (row >= rows) break;
+		const SongLine& L = lines[row];
+
+		int ry = g.list_y + i * g.row_h;
+
+		if (L.goto_target >= 0) {
+			// Goto-line: distinct colour, RMT-style "GO TO LINE XX".
+			char line[64];
+			std::snprintf(line, sizeof(line), "%02X  GO TO LINE %02X",
+				row & 0xFF, L.goto_target & 0xFF);
+			DrawText(r, kAccent, g.x, ry, line);
+			continue;
+		}
+
+		// Highlight any row whose channel slot uses the currently
+		// selected track index, so Ctrl+wheel selection has a visible
+		// effect on the list.
+		bool uses_sel = false;
+		for (int c = 0; c < channels; ++c) {
+			if (L.tracks[c] == m_song_track) { uses_sel = true; break; }
+		}
+		if (uses_sel) {
+			// Highlight sits cleanly inside the current row's slot - no
+			// vertical overdraw onto the row above (the row stride is
+			// g.row_h, so the fill must stay strictly within that band).
+			FillRect(r, Col{ 38, 44, 56 }, g.x, ry + 2, g.w - 4, g.row_h - 2);
+		}
+
+		// Draw the line number, then each cell at its fixed x slot. The
+		// per-cell layout (constants above) must match the row hit-test
+		// in SongCellAt so a click and the painted text agree on which
+		// column was hit.
+		char hdr[8];
+		std::snprintf(hdr, sizeof(hdr), "%02X", row & 0xFF);
+		DrawText(r, kText, g.x, ry, hdr);
+		for (int c = 0; c < channels; ++c) {
+			char cell[4];
+			if (L.tracks[c] >= 0) std::snprintf(cell, sizeof(cell), "%02X", L.tracks[c] & 0xFF);
+			else                  std::snprintf(cell, sizeof(cell), "--");
+			DrawText(r, kText, g.x + kSongCellsX + c * kSongCellW, ry, cell);
+		}
+	}
+
+	// Scroll indicator: "n/m" at the right end of the title row.
+	if (rows > g.visible) {
+		char scr[32];
+		std::snprintf(scr, sizeof(scr), "%d/%d", m_song_scroll + 1, rows);
+		int sw = (int)std::strlen(scr) * GlyphW();
+		DrawText(r, kTextDim, g.x + g.w - sw - 4, g.y + 6, scr);
+	}
+}
+
+void Gui::DrawTrackView(SDL_Renderer* r, const GuiState& s)
+{
+	TrackGeom g = ComputeTrackGeom();
+	const int gh = GlyphH();
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+
+	const int num_tr = std::max(meta.num_tracks, 0);
+	if (num_tr > 0) m_song_track = std::clamp(m_song_track, 0, num_tr - 1);
+	else            m_song_track = 0;
+
+	// Title row: "Track NN  ch N" + [<] [>]. The channel suffix tells the
+	// user which POKEY voice a clicked note row will play on (set when
+	// they pick the track from a song-order cell).
+	char title[32];
+	std::snprintf(title, sizeof(title), "Track %02X  ch %d",
+		m_song_track & 0xFF, m_song_channel);
+	DrawText(r, kHighlight, g.x, g.y + 6, title);
+
+	auto DrawArrow = [&](int bx, int bw, const char* glyph, bool enabled) {
+		Col bg = enabled ? Col{ 55, 58, 70 } : Col{ 35, 36, 42 };
+		FillRect(r, bg, bx, g.arrow_y, bw, g.arrow_h);
+		OutlineRect(r, enabled ? kBorder : Col{ 45, 46, 52 },
+		            bx, g.arrow_y, bw, g.arrow_h);
+		int tw = (int)std::strlen(glyph) * GlyphW();
+		DrawText(r, enabled ? kText : kTextDim,
+		         bx + std::max(0, (bw - tw) / 2),
+		         g.arrow_y + std::max(0, (g.arrow_h - gh) / 2),
+		         glyph);
+	};
+	bool can_step = num_tr > 0;
+	DrawArrow(g.arrow_left_x,  g.arrow_left_w,  "<", can_step);
+	DrawArrow(g.arrow_right_x, g.arrow_right_w, ">", can_step);
+
+	if (!meta.valid || m_song_track >= (int)meta.tracks.size() ||
+	    meta.tracks[m_song_track].empty()) {
+		DrawText(r, kTextDim, g.x, g.list_y, "(no track data)");
+		return;
+	}
+
+	std::vector<TrackRow> rows;
+	int len = 0, go = -1;
+	DecodeTrack(meta.tracks[m_song_track], rows, len, go);
+
+	// How many active lines this track has. Anything past `len` is shown
+	// dim (matches RMT's gray "padding" zone).
+	const int active = std::clamp(len, 0, (int)rows.size());
+
+	// Clamp scroll.
+	int max_scroll = std::max(0, active - g.visible);
+	m_track_scroll = std::clamp(m_track_scroll, 0, max_scroll);
+
+	// Draw rows.
+	for (int i = 0; i < g.visible; ++i) {
+		int row = m_track_scroll + i;
+		if (row >= (int)rows.size()) break;
+		const TrackRow& R = rows[row];
+		int ry = g.list_y + i * g.row_h;
+
+		// Build the row string: "NN  C-3 II vV Fxx"
+		char line[32];
+		char note[4];
+		NoteToString(R.note, note);
+
+		char instr[3] = { '-', '-', 0 };
+		if (R.instr >= 0) {
+			static const char hexd[] = "0123456789ABCDEF";
+			instr[0] = hexd[(R.instr >> 4) & 0xF];
+			instr[1] = hexd[R.instr & 0xF];
+		}
+		char vol[3] = { '-', '-', 0 };
+		if (R.vol >= 0) {
+			static const char hexd[] = "0123456789ABCDEF";
+			vol[0] = 'v';
+			vol[1] = hexd[R.vol & 0xF];
+		}
+		char spd[4] = { '-', '-', '-', 0 };
+		if (R.speed >= 0) {
+			static const char hexd[] = "0123456789ABCDEF";
+			spd[0] = 'F';
+			spd[1] = hexd[(R.speed >> 4) & 0xF];
+			spd[2] = hexd[R.speed & 0xF];
+		}
+		std::snprintf(line, sizeof(line), "%02X %s %s %s %s",
+		              row & 0xFF, note, instr, vol, spd);
+
+		Col col = (row < active) ? kText : Col{ 80, 84, 92 };
+		if (row == go) {
+			DrawText(r, kAccent, g.x, ry, line);
+		} else {
+			DrawText(r, col, g.x, ry, line);
+		}
+	}
+
+	// Show track length + goto position at the right end of the title row.
+	{
+		char info[32];
+		if (go >= 0) std::snprintf(info, sizeof(info), "len=%d go=%d", len, go);
+		else         std::snprintf(info, sizeof(info), "len=%d", len);
+		int iw = (int)std::strlen(info) * GlyphW();
+		DrawText(r, kTextDim, g.x + g.w - iw - 4, g.y + 6, info);
+	}
+}
+
+bool Gui::PointInSongOrder(int x, int y) const
+{
+	SongGeom g = ComputeSongGeom();
+	return x >= g.x && x < g.x + g.w && y >= g.y && y < g.y + g.h;
+}
+
+Gui::SongCellHit Gui::SongCellAt(int x, int y, const GuiState& s) const
+{
+	SongCellHit hit;
+	SongGeom g = ComputeSongGeom();
+	if (x < g.x || x >= g.x + g.w) return hit;
+	if (y < g.list_y || y >= g.list_y + g.visible * g.row_h) return hit;
+
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+	if (!meta.valid || meta.song_data.empty()) return hit;
+
+	std::vector<SongLine> lines = DecodeSong(meta);
+	int local = (y - g.list_y) / g.row_h;
+	int row   = m_song_scroll + local;
+	if (row < 0 || row >= (int)lines.size()) return hit;
+	if (lines[row].goto_target >= 0) return hit;   // goto-line: not a cell
+
+	int channels = (meta.channels == '8') ? 8 : 4;
+	int dx = x - (g.x + kSongCellsX);
+	if (dx < 0) return hit;
+	int col = dx / kSongCellW;
+	if (col < 0 || col >= channels) return hit;
+	int tr = lines[row].tracks[col];
+	if (tr < 0) return hit;   // empty cell, nothing to select
+	hit.track   = tr;
+	hit.channel = col;
+	return hit;
+}
+
+void Gui::SelectTrack(int track_index, const GuiState& s, int channel)
+{
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+	int nt = std::max(1, meta.num_tracks);
+	if (track_index < 0) return;
+	m_song_track   = std::clamp(track_index, 0, nt - 1);
+	m_track_scroll = 0;
+	if (channel >= 0) {
+		int nc = (meta.channels == '8') ? 8 : 4;
+		m_song_channel = std::clamp(channel, 0, nc - 1);
+	}
+}
+
+void Gui::ScrollSongOrder(int notches, bool ctrl, const GuiState& s)
+{
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+	if (!meta.valid) return;
+
+	if (ctrl) {
+		StepTrack(notches, s);
+		return;
+	}
+	SongGeom g = ComputeSongGeom();
+	int rows = (int)DecodeSong(meta).size();
+	int max_scroll = std::max(0, rows - g.visible);
+	m_song_scroll = std::clamp(m_song_scroll + notches, 0, max_scroll);
+}
+
+bool Gui::PointInTrackView(int x, int y) const
+{
+	TrackGeom g = ComputeTrackGeom();
+	return x >= g.x && x < g.x + g.w && y >= g.y && y < g.y + g.h;
+}
+
+int Gui::TrackArrowAt(int x, int y) const
+{
+	TrackGeom g = ComputeTrackGeom();
+	if (y < g.arrow_y || y >= g.arrow_y + g.arrow_h) return 0;
+	if (x >= g.arrow_left_x  && x < g.arrow_left_x  + g.arrow_left_w)  return -1;
+	if (x >= g.arrow_right_x && x < g.arrow_right_x + g.arrow_right_w) return +1;
+	return 0;
+}
+
+void Gui::StepTrack(int delta, const GuiState& s)
+{
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+	int nt = std::max(1, meta.num_tracks);
+	m_song_track = ((m_song_track + delta) % nt + nt) % nt;
+	m_track_scroll = 0;   // reset scroll so the new track starts at the top
+}
+
+Gui::TrackRowHit Gui::TrackRowAt(int x, int y, const GuiState& s) const
+{
+	TrackRowHit hit;
+	TrackGeom g = ComputeTrackGeom();
+	if (x < g.x || x >= g.x + g.w) return hit;
+	if (y < g.list_y || y >= g.list_y + g.visible * g.row_h) return hit;
+
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+	if (!meta.valid || m_song_track >= (int)meta.tracks.size()) return hit;
+
+	std::vector<TrackRow> rows;
+	int len = 0, go = -1;
+	DecodeTrack(meta.tracks[m_song_track], rows, len, go);
+
+	int local = (y - g.list_y) / g.row_h;
+	int row = m_track_scroll + local;
+	if (row < 0 || row >= len) return hit;
+
+	hit.row  = row;
+	hit.note = rows[row].note;
+
+	// Carry the most-recently-specified instr/vol forward from earlier
+	// rows - that's what RMT does at playback when a row has -1.
+	int eff_instr = -1, eff_vol = -1;
+	for (int i = 0; i <= row; ++i) {
+		if (rows[i].instr >= 0) eff_instr = rows[i].instr;
+		if (rows[i].vol   >= 0) eff_vol   = rows[i].vol;
+	}
+	hit.instr = eff_instr;
+	hit.vol   = eff_vol;
+	return hit;
+}
+
+void Gui::ScrollTrackView(int notches, bool ctrl, const GuiState& s)
+{
+	if (ctrl) { StepTrack(notches, s); return; }
+
+	const Bank::RmtModuleMeta empty;
+	const Bank::RmtModuleMeta& meta = s.bank ? s.bank->RmtSource() : empty;
+	if (!meta.valid || m_song_track >= (int)meta.tracks.size()) return;
+
+	std::vector<TrackRow> rows;
+	int len = 0, go = -1;
+	DecodeTrack(meta.tracks[m_song_track], rows, len, go);
+
+	TrackGeom g = ComputeTrackGeom();
+	int max_scroll = std::max(0, len - g.visible);
+	m_track_scroll = std::clamp(m_track_scroll + notches, 0, max_scroll);
+}
 
 void Gui::DrawBankMenu(SDL_Renderer* r, const GuiState& s)
 {
@@ -2512,7 +3123,7 @@ namespace {
 		{ "Ctrl+V",           "(EDIT) Paste into the selected slot" },
 		{ "Ctrl+Y",           "(EDIT) Redo the last instrument edit" },
 		{ "Ctrl+S",           "(EDIT) Export current instrument as a new .RTI" },
-		{ "Ctrl+Z",           "Undo - always available regardless of EDIT state" },
+		{ "Ctrl+Z",           "(EDIT) Undo - outside EDIT, plays the 'Z' note" },
 		{ "", "" },
 		{ "Tree views", "" },
 		{ "F8 / F9 / F10",    "Categories / Hide duplicates / Clusters toggle" },
@@ -2617,8 +3228,11 @@ namespace {
 		{ "",               "If the analyser mis-classifies a file you can pin its" },
 		{ "",               "category manually. The override survives F7 re-analysis." },
 		{ "Right-click row","'Override category...' opens a colour-coded picker" },
-		{ "Ctrl+R",         "Cycle the current file's manual category (forward)" },
-		{ "Ctrl+Shift+R",   "Clear every manual override in the library at once" },
+		{ "Shift+Ctrl+R",   "Cycle the current file's manual category (forward)" },
+		{ "Ctrl+Alt+R",     "Clear every manual override in the library at once" },
+		{ "",               "Plain Ctrl+R is reserved for the audition ramp - it plays" },
+		{ "",               "the 'R' note like the other Ctrl+letter keys, so the" },
+		{ "",               "reclassify shortcuts take an extra modifier." },
 		{ "", "" },
 		{ "How overrides are shown", "" },
 		{ "",   "Overridden rows display an 'M' marker at the right edge of the" },
@@ -2806,6 +3420,7 @@ namespace {
 		{ "Name",       "Instrument name text. Type characters directly." },
 		{ "",           "Backspace / Delete remove; arrows move the caret." },
 		{ "",           "Maximum 32 characters." },
+		{ "",           "Enter commits the rename into the bank and exits Edit mode." },
 		{ "Parameters", "Top numeric panel - envelope length, table length, fade," },
 		{ "",           "vibrato, AUDCTL flags, etc. Two-digit hex fields compose" },
 		{ "",           "as you type (first nibble shifts left, second fills low)." },
@@ -2845,7 +3460,8 @@ namespace {
 		{ "Space",            "Re-trigger the last note with the latest changes." },
 		{ "", "" },
 		{ "Undo and redo", "" },
-		{ "Ctrl+Z",  "Undo. Always available; stack resets on instrument load." },
+		{ "Ctrl+Z",  "Undo. Requires Bank EDIT mode - outside EDIT, Ctrl+Z" },
+		{ "",        "plays the 'Z' note so it can't fire by accident." },
 		{ "Ctrl+Y",  "Redo. Requires Bank EDIT mode - outside EDIT, Ctrl+Y" },
 		{ "",        "plays the 'Y' note so it can't fire by accident." },
 		{ "", "" },
